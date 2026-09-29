@@ -89,8 +89,8 @@ const tokenFileEnv = process.env.BOT_TOKENS || process.env.BOT_TOKEN || '';
 const tokenFileKey = (process.env.TOKEN_FILE_KEY || '').trim();
 
 const loudness = {
-  volume: clampNumber(process.env.AUDIO_VOLUME, 0.5, 100, 12),
-  drive: clampNumber(process.env.AUDIO_DRIVE, 0, 100, 40),
+  volume: clampNumber(process.env.AUDIO_VOLUME, 0.5, 100, 18),
+  drive: clampNumber(process.env.AUDIO_DRIVE, 0, 100, 55),
   limiter: (process.env.AUDIO_LIMITER || 'true').toLowerCase() !== 'false',
   targetLufs: process.env.AUDIO_TARGET_LUFS ? clampNumber(process.env.AUDIO_TARGET_LUFS, -31, -4, null) : null,
   micGain: clampNumber(process.env.MIC_GAIN, 0.1, 20, 6),
@@ -191,10 +191,10 @@ function watchTokenFile() {
 // Sources that run dry are padded with silence, so a bus never stalls.
 // The mixers hold a few hundred ms of source so a fast decoder never has to
 // drop audio, and the decoder is throttled against that (see pushMusicChunk).
-// 28800 frames at 48 kHz = 600 ms, i.e. a 230 kB buffer per source.
-const MUSIC_SOURCE_FRAMES = 28800;
-const MUSIC_PAUSE_BYTES = 115200;
-const MUSIC_RESUME_BYTES = 38400;
+// Two seconds of headroom per source absorbs short event-loop delays.
+const MUSIC_SOURCE_FRAMES = 96000;
+const MUSIC_PAUSE_BYTES = 230400;
+const MUSIC_RESUME_BYTES = 76800;
 const buses = {
   mix: { mixer: new PcmMixer({ maxPendingFrames: MUSIC_SOURCE_FRAMES }), player: null, encoder: null, resource: null, retryTimer: null, broken: false },
   music: { mixer: new PcmMixer({ maxPendingFrames: MUSIC_SOURCE_FRAMES }), player: null, encoder: null, resource: null, retryTimer: null, broken: false },

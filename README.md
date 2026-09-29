@@ -60,9 +60,9 @@ keep using the `BOT_TOKENS` env var, which is written into the file once at star
 Old behaviour was a single `volume=N` ffmpeg pass, which just clips past ~1.0.
 Audio now runs through a float PCM mixer and a proper chain:
 
-1. **Volume (pre-gain)** (0.5–100, default 12) — the loudness knob. Applied in
+1. **Volume (pre-gain)** (0.5–100, default 18) — the loudness knob. Applied in
    float, so a high multiplier cannot clip on its own
-2. **Drive** (0–100, default 40) — `acompressor` with makeup gain. Character, not
+2. **Drive** (0–100, default 55) — `acompressor` with makeup gain. Character, not
    level: it squeezes peaks so more of the track sits near the ceiling
 3. **Target LUFS** (optional) — `loudnorm` pass, e.g. `-9`, for a guaranteed level
 4. **Limiter** (on by default) — `alimiter` holding the peak at 0.95, so no
@@ -100,11 +100,10 @@ frames over a WebSocket to `/mic/stream`. The server mixes them into per-account
 Set the default with `MIC_ROUTE_DEFAULT` or per account from the routing table.
 Music is decoded once and fanned out, so every account stays in sync.
 
-Playback is throttled in software, not by ffmpeg. ffmpeg decodes a three-minute
-track in about a second, so after every chunk the server checks how far ahead the
-mixers are and pauses the decoder until they catch up (300 ms ahead = pause,
-100 ms = resume). The mixers buffer 600 ms, so nothing is ever dropped and
-nothing is ever buffered beyond a few hundred kB.
+Playback is throttled against the audio clock. The server pauses decoding when
+the music queue reaches 600 ms and resumes when it drains to 200 ms. Each mixer
+keeps up to two seconds of headroom to absorb short scheduling delays without
+dropping audio; playback remains paced in real time.
 
 Measured on a 3-minute file: 112 ms from *Play* to the first sample, 0% silent
 blocks over 12 s, memory flat. An earlier version buffered the decoded track in
@@ -131,7 +130,7 @@ Use these values in Render:
   - `HOST=0.0.0.0`
   - `PORT=10000`
   - `TOKENS_FILE=tokens.txt`
-  - `AUDIO_VOLUME=12`, `AUDIO_DRIVE=40`, `AUDIO_LIMITER=true`
+  - `AUDIO_VOLUME=18`, `AUDIO_DRIVE=55`, `AUDIO_LIMITER=true`
   - `MIC_GAIN=6`, `MIC_ROUTE_DEFAULT=mix`
   - `VOICE_CHANNEL_IDS=your-channel-id-here` (only needed with `AUTO_JOIN=true`)
 

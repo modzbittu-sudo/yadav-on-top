@@ -85,8 +85,8 @@ function renderHomePage() {
     </div>
 
     <div class="control">
-      <label>Volume (pre-gain): <span id="volDisplay">12x</span></label>
-      <input type="range" id="volSlider" min="0.5" max="100" step="0.1" value="12" />
+      <label>Volume (pre-gain): <span id="volDisplay">18x</span></label>
+      <input type="range" id="volSlider" min="0.5" max="100" step="0.1" value="18" />
       <div class="hint">The loudness knob. Applied in float before the chain, so it never clips on its own - the limiter holds the peak at 0.95.</div>
     </div>
 
