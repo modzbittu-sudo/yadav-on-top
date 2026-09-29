@@ -4,7 +4,6 @@ Render web service deployment setup for the Discord voice bot host.
 
 - Dashboard: `/` — add tokens (one or bulk), voice control, loud audio player, bot list
 - Token file: `/token-file` — add tokens, or edit `tokens.txt` directly
-- Mic routing: `/mic-route` — capture the browser mic and route it per account
 
 ## Choosing a voice channel
 
@@ -21,8 +20,7 @@ mean opposite things:
 
 With 30 accounts you will usually have a mix of both: the ones that are in the
 server connect, the rest fail with the reason shown next to each account under
-*Accounts*. Only accounts that actually connected will hear the music or the mic,
-which is why the mic looks "not working" when most of them failed the join.
+*Accounts*. Only accounts that actually connected will hear the shared music.
 
 A join now runs in batches of 5 (Discord rate-limits, and 30 accounts serially
 takes minutes) and logs one summary line instead of three lines per account.
@@ -81,28 +79,14 @@ identical. Measured with real ffmpeg on the same input:
 | volume 12 + drive 40 + limiter | −5.7 dBFS | 31130 |
 | volume 12 + drive 40 + −9 LUFS | −11.4 dBFS | 23997 |
 
-Music gain stays constant while the mic is live. Volume remains adjustable on
-the dashboard or via `POST /audio/loudness`.
+All connected accounts use the same shared music bus and volume. Volume remains
+adjustable on the dashboard or via `POST /audio/loudness`.
 
-## Mic routing
-
-`/mic-route` captures the browser mic (echo cancellation, noise suppression and
-auto gain off), resamples to 48 kHz mono with an AudioWorklet and streams 20 ms PCM
-frames over a WebSocket to `/mic/stream`. The server mixes them into per-account buses:
-
-| Route | What the account hears |
-| --- | --- |
-| `mix` | music + mic (default) |
-| `music` | music only |
-| `mic` | mic only |
-| `off` | nothing (unsubscribed) |
-
-Set the default with `MIC_ROUTE_DEFAULT` or per account from the routing table.
-Music is decoded once and fanned out, so every account stays in sync.
+## Playback
 
 Playback is throttled against the audio clock. The server pauses decoding when
-the music queue reaches 600 ms and resumes when it drains to 200 ms. Each mixer
-keeps up to two seconds of headroom to absorb short scheduling delays without
+the music queue reaches 600 ms and resumes when it drains to 200 ms. The shared
+mixer keeps up to two seconds of headroom to absorb short scheduling delays without
 dropping audio; playback remains paced in real time.
 
 Measured on a 3-minute file: 112 ms from *Play* to the first sample, 0% silent
@@ -131,7 +115,6 @@ Use these values in Render:
   - `PORT=10000`
   - `TOKENS_FILE=tokens.txt`
   - `AUDIO_VOLUME=32`, `AUDIO_DRIVE=85`, `AUDIO_LIMITER=true`
-  - `MIC_GAIN=6`, `MIC_ROUTE_DEFAULT=mix`
   - `VOICE_CHANNEL_IDS=your-channel-id-here` (only needed with `AUTO_JOIN=true`)
 
 ## HTTP endpoints
@@ -140,8 +123,6 @@ Use these values in Render:
 | --- | --- | --- |
 | GET | `/` | dashboard |
 | GET | `/token-file` | token file page |
-| GET | `/mic-route` | mic routing page |
-| GET | `/mic-worklet.js` | AudioWorklet used by the mic page |
 | GET | `/health`, `/status`, `/settings` | health, bot status, full settings |
 | GET | `/tokens` | masked token list (raw tokens are never served here) |
 | GET | `/api/tokens/file` | raw file content — needs `TOKEN_FILE_KEY` if set |
@@ -154,9 +135,6 @@ Use these values in Render:
 | POST | `/audio/upload`, `/audio/play`, `/audio/stop` | music player |
 | POST | `/audio/loudness` | volume / drive / LUFS / limiter |
 | POST | `/audio/mute`, `/audio/unmute`, `/audio/deafen`, `/audio/undeafen` | voice flags |
-| WS | `/mic/stream` | mic PCM stream |
-| GET | `/mic/status` | mic client + packet counters |
-| POST | `/mic/routing`, `/mic/stop` | routing, drop mic clients |
 
 ## Tests
 
@@ -164,9 +142,8 @@ Use these values in Render:
 npm test
 ```
 
-Covers the token file parser, the PCM mixer, the loudness filter builder, the
-inline page scripts, and a full server smoke test (fake Discord client + fake
-ffmpeg) that streams mic audio over a real WebSocket and checks the routing.
+Covers the token file parser, PCM mixer, loudness filter, inline page scripts,
+and server smoke tests with fake Discord clients and fake ffmpeg.
 
 ## Notes
 

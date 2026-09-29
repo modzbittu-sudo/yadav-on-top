@@ -2,47 +2,15 @@ require('dotenv').config();
 
 const { Client } = require('discord.js-selfbot-v13');
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, NoSubscriberBehavior, StreamType, VoiceConnectionStatus, entersState } = require('@discordjs/voice');
-const { WebSocketServer } = require('ws');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const ffmpeg = require('ffmpeg-static');
 const { AUDIO_DEFAULTS, MUSIC_BUFFER } = require('./audio-config');
-const { PcmMixer, buildLoudnessFilter, createEncoder, createDecoder, INT16_SAMPLE_BYTES, INT16_BYTES_PER_FRAME } = require('./audio-pipeline');
+const { PcmMixer, buildLoudnessFilter, createEncoder, createDecoder } = require('./audio-pipeline');
 const { readTokenFile, writeTokenFile, diffTokenLists, mergeTokenFile } = require('./token-store');
 const { renderHomePage } = require('./views/home');
-const { renderMicRoutePage } = require('./views/mic-route');
 const { renderTokenFilePage } = require('./views/token-file');
-
-const MIC_WORKLET_SOURCE = `class VeeraPcmTap extends AudioWorkletProcessor {
-  constructor(options) {
-    super();
-    var opts = options.processorOptions || {};
-    this.blockFrames = opts.blockFrames || 960;
-    this.buffer = new Float32Array(this.blockFrames);
-    this.offset = 0;
-  }
-  process(inputs) {
-    var input = inputs[0];
-    var channel = input && input[0];
-    if (!channel) return true;
-    for (var i = 0; i < channel.length; i++) {
-      this.buffer[this.offset++] = channel[i];
-      if (this.offset === this.blockFrames) {
-        var pcm = new Int16Array(this.blockFrames);
-        for (var j = 0; j < this.blockFrames; j++) {
-          var sample = this.buffer[j] < -1 ? -1 : (this.buffer[j] > 1 ? 1 : this.buffer[j]);
-          pcm[j] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
-        }
-        this.port.postMessage({ type: 'pcm', buffer: pcm.buffer }, [pcm.buffer]);
-        this.offset = 0;
-      }
-    }
-    return true;
-  }
-}
-registerProcessor('veera-pcm-tap', VeeraPcmTap);
-`;
 
 function parseList(value) {
   return (value || '')
@@ -94,15 +62,8 @@ const loudness = {
   drive: clampNumber(process.env.AUDIO_DRIVE, 0, 100, AUDIO_DEFAULTS.drive),
   limiter: (process.env.AUDIO_LIMITER || String(AUDIO_DEFAULTS.limiter)).toLowerCase() !== 'false',
   targetLufs: process.env.AUDIO_TARGET_LUFS ? clampNumber(process.env.AUDIO_TARGET_LUFS, -31, -4, null) : null,
-  micGain: clampNumber(process.env.MIC_GAIN, 0.1, 20, AUDIO_DEFAULTS.micGain),
 };
 
-const routing = {
-  default: ['mix', 'music', 'mic', 'off'].includes(process.env.MIC_ROUTE_DEFAULT) ? process.env.MIC_ROUTE_DEFAULT : 'mix',
-  bots: {},
-};
-
-const micState = { clients: new Set(), packets: 0, lastPacketAt: null, channels: 1 };
 const tokenSync = { lastSyncAt: null, lastTrigger: 'startup', added: 0, removed: 0 };
 let tokens = [];
 
@@ -196,8 +157,6 @@ function watchTokenFile() {
 const { maxFrames: MUSIC_SOURCE_FRAMES, pauseBytes: MUSIC_PAUSE_BYTES, resumeBytes: MUSIC_RESUME_BYTES } = MUSIC_BUFFER;
 const buses = {
   mix: { mixer: new PcmMixer({ maxPendingFrames: MUSIC_SOURCE_FRAMES }), player: null, encoder: null, resource: null, retryTimer: null, broken: false },
-  music: { mixer: new PcmMixer({ maxPendingFrames: MUSIC_SOURCE_FRAMES }), player: null, encoder: null, resource: null, retryTimer: null, broken: false },
-  mic: { mixer: new PcmMixer(), player: null, encoder: null, resource: null, retryTimer: null, broken: false },
 };
 
 function currentFilter() {
@@ -289,54 +248,16 @@ function applyLoudnessFilter() {
     stopBus(name);
     startBus(name);
   }
-  applyRouting();
-}
-
-function isMicActive() {
-  return Boolean(micState.lastPacketAt) && Date.now() - micState.lastPacketAt < 250;
 }
 
 function refreshGains() {
   buses.mix.mixer.setSourceGain('music', loudness.volume);
-  buses.music.mixer.setSourceGain('music', loudness.volume);
-  buses.mix.mixer.setSourceGain('mic', loudness.micGain);
-  buses.mic.mixer.setSourceGain('mic', loudness.micGain);
-}
-
-// The browser sends Int16 mono; the mixer works in float stereo.
-function micToStereoFloat(buffer, channels) {
-  const samples = Math.floor(buffer.length / INT16_SAMPLE_BYTES);
-  const alreadyStereo = channels === 2 && samples % 2 === 0;
-  const out = Buffer.allocUnsafe(alreadyStereo ? samples * 4 : samples * 8);
-
-  for (let index = 0; index < samples; index++) {
-    const sample = buffer.readInt16LE(index * INT16_SAMPLE_BYTES) / 32768;
-    if (alreadyStereo) {
-      out.writeFloatLE(sample, index * 4);
-    } else {
-      out.writeFloatLE(sample, index * 8);
-      out.writeFloatLE(sample, index * 8 + 4);
-    }
-  }
-  return out;
-}
-
-function pushMicChunk(chunk, channels) {
-  if (!chunk || !chunk.length) return;
-  const stereo = micToStereoFloat(chunk, channels || 1);
-  buses.mix.mixer.writeSource('mic', stereo);
-  buses.mic.mixer.writeSource('mic', stereo);
-  micState.packets += 1;
-  micState.lastPacketAt = Date.now();
 }
 
 let musicError = null;
 
 function musicPending() {
-  return Math.max(
-    buses.mix.mixer.sourcePending('music'),
-    buses.music.mixer.sourcePending('music'),
-  );
+  return buses.mix.mixer.sourcePending('music');
 }
 
 function releaseMusicPressure() {
@@ -345,13 +266,11 @@ function releaseMusicPressure() {
 
 // Resume decoding from the audio clock after both music queues drain.
 buses.mix.mixer.onTick = releaseMusicPressure;
-buses.music.mixer.onTick = releaseMusicPressure;
 
 function pushMusicChunk(chunk) {
   if (!chunk || !chunk.length) return;
 
   buses.mix.mixer.writeSource('music', chunk);
-  buses.music.mixer.writeSource('music', chunk);
   if (musicPending() >= MUSIC_PAUSE_BYTES) musicDecoder?.pause();
 }
 
@@ -440,33 +359,15 @@ function playGlobalAudio() {
 function stopGlobalAudio() {
   musicError = null;
   buses.mix.mixer.clearSource('music');
-  buses.music.mixer.clearSource('music');
   if (!musicDecoder) return;
   musicDecoder.kill();
   musicDecoder = null;
 }
 
-const ROUTE_MODES = ['mix', 'music', 'mic', 'off'];
-
-function routeForBot(index) {
-  const mode = routing.bots[index] || routing.default;
-  return ROUTE_MODES.includes(mode) ? mode : 'mix';
-}
-
-function applyRouting() {
-  bots.forEach((bot, index) => {
-    const connection = bot.getConnection();
-    if (!connection) return;
-
-    const mode = routeForBot(index);
-    if (mode === 'off') {
-      try { connection.subscribe(null); } catch (error) { /* connection gone */ }
-      return;
-    }
-
-    startBus(mode);
-    try { connection.subscribe(buses[mode].player); } catch (error) { /* connection gone */ }
-  });
+function subscribeMusic(connection) {
+  if (!connection) return;
+  startBus('mix');
+  try { connection.subscribe(buses.mix.player); } catch (error) { /* connection gone */ }
 }
 
 // --- BOTS -----------------------------------------------------------------
@@ -512,7 +413,7 @@ function createBot(token, index) {
       if (voiceConnection && bot.channelId === targetChannelId && voiceConnection.state?.status === 'ready') {
         console.log(`ℹ️ [Bot ${index + 1}] Already in channel ${targetChannelId}`);
         bot.voiceState = 'connected';
-        applyRoutingFor(bot, index, voiceConnection);
+        subscribeMusic(voiceConnection);
         return true;
       }
 
@@ -592,7 +493,7 @@ function createBot(token, index) {
               selfMute: globalMute,
             });
 
-            applyRoutingFor(bot, index, voiceConnection);
+            subscribeMusic(voiceConnection);
 
             await entersState(voiceConnection, VoiceConnectionStatus.Ready, 30000);
             joined = true;
@@ -693,19 +594,6 @@ function createBot(token, index) {
   return bot;
 }
 
-function applyRoutingFor(bot, index, connection) {
-  if (!connection) return;
-
-  const mode = routeForBot(index);
-  if (mode === 'off') {
-    try { connection.subscribe(null); } catch (error) { /* connection gone */ }
-    return;
-  }
-
-  startBus(mode);
-  try { connection.subscribe(buses[mode].player); } catch (error) { /* connection gone */ }
-}
-
 const bots = [];
 let globalMute = true;
 let globalDeaf = false;
@@ -764,20 +652,12 @@ if (tokens.length > 0) {
 
 console.log(`🧠 Loudness chain: ${currentFilter()}`);
 console.log(`🎚️  ffmpeg: ${ffmpegPath}`);
-setInterval(refreshGains, 200);
 refreshGains();
 
 function describeSettings() {
   return {
     loudness: { ...loudness },
     tokenFile: describeTokenFile(),
-    mic: {
-      active: isMicActive(),
-      clients: micState.clients.size,
-      packets: micState.packets,
-      channels: micState.channels,
-      routing: { default: routing.default, bots: { ...routing.bots } },
-    },
     audio: {
       ffmpegPath,
       filter: currentFilter(),
@@ -800,7 +680,6 @@ function botStatusPayload() {
     guildId: bot.guildId,
     lastError: bot.lastError,
     tag: bot.getTag(),
-    route: routeForBot(index),
   }));
 }
 
@@ -810,18 +689,6 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === '/' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(renderHomePage());
-    return;
-  }
-
-  if (url.pathname === '/mic-route' && req.method === 'GET') {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(renderMicRoutePage());
-    return;
-  }
-
-  if (url.pathname === '/mic-worklet.js' && req.method === 'GET') {
-    res.writeHead(200, { 'Content-Type': 'application/javascript; charset=utf-8' });
-    res.end(MIC_WORKLET_SOURCE);
     return;
   }
 
@@ -881,7 +748,6 @@ const server = http.createServer(async (req, res) => {
       bots: payload,
       joinedAll: payload.length > 0 && payload.every((bot) => bot.connected),
       loudness: { ...loudness },
-      routing: { default: routing.default, bots: { ...routing.bots } },
     });
     return;
   }
@@ -1061,8 +927,6 @@ const server = http.createServer(async (req, res) => {
     }
     // Start the output path before decoding so startup audio has an active bus.
     startBus('mix');
-    startBus('music');
-    applyRouting();
     if (!playGlobalAudio()) {
       sendJSON(res, 500, { error: 'Could not start playback' });
       return;
@@ -1086,7 +950,6 @@ const server = http.createServer(async (req, res) => {
       const filterBefore = currentFilter();
 
       if (body.volume !== undefined) loudness.volume = clampNumber(body.volume, 0.5, 100, loudness.volume);
-      if (body.micGain !== undefined) loudness.micGain = clampNumber(body.micGain, 0.1, 20, loudness.micGain);
       if (body.drive !== undefined) loudness.drive = clampNumber(body.drive, 0, 100, loudness.drive);
       if (body.limiter !== undefined) loudness.limiter = Boolean(body.limiter);
       if (body.targetLufs !== undefined) {
@@ -1104,57 +967,6 @@ const server = http.createServer(async (req, res) => {
     } catch (error) {
       sendJSON(res, 500, { error: error.message });
     }
-    return;
-  }
-
-  if (url.pathname === '/mic/status' && req.method === 'GET') {
-    sendJSON(res, 200, {
-      active: isMicActive(),
-      clients: micState.clients.size,
-      packets: micState.packets,
-      channels: micState.channels,
-      lastPacketAt: micState.lastPacketAt,
-      routing: { default: routing.default, bots: { ...routing.bots } },
-      loudness: { ...loudness },
-    });
-    return;
-  }
-
-  if (url.pathname === '/mic/routing' && req.method === 'POST') {
-    try {
-      const body = await parseJSONBody(req);
-      if (body.default !== undefined) {
-        if (!['mix', 'music', 'mic', 'off'].includes(body.default)) {
-          sendJSON(res, 400, { error: 'Unknown route' });
-          return;
-        }
-        routing.default = body.default;
-      }
-      if (body.bots && typeof body.bots === 'object') {
-        for (const [index, mode] of Object.entries(body.bots)) {
-          if (!['mix', 'music', 'mic', 'off'].includes(mode)) continue;
-          routing.bots[index] = mode;
-        }
-      }
-      applyRouting();
-      sendJSON(res, 200, {
-        status: 'Routing updated.',
-        routing: { default: routing.default, bots: { ...routing.bots } },
-      });
-    } catch (error) {
-      sendJSON(res, 500, { error: error.message });
-    }
-    return;
-  }
-
-  if (url.pathname === '/mic/stop' && req.method === 'POST') {
-    const closed = micState.clients.size;
-    for (const client of micState.clients) {
-      try { client.close(1000, 'stopped by dashboard'); } catch (error) { /* already closed */ }
-    }
-    micState.clients.clear();
-    micState.lastPacketAt = null;
-    sendJSON(res, 200, { status: `Disconnected ${closed} mic client(s).` });
     return;
   }
 
@@ -1225,7 +1037,6 @@ const server = http.createServer(async (req, res) => {
             channelId: bot.channelId,
             guildId: bot.guildId,
             lastError: bot.lastError,
-            route: routeForBot(index),
             success,
           };
         });
@@ -1267,56 +1078,11 @@ const server = http.createServer(async (req, res) => {
   sendJSON(res, 404, { error: 'not found' });
 });
 
-// --- MIC WEBSOCKET --------------------------------------------------------
-const wss = new WebSocketServer({ server, path: '/mic/stream', maxPayload: 512 * 1024 });
-
-wss.on('connection', (socket) => {
-  micState.clients.add(socket);
-  socket.isAlive = true;
-  socket.on('pong', () => { socket.isAlive = true; });
-  // Keep the mix bus live so mic audio is ready even before anyone joins.
-  startBus('mix');
-  console.log(`🎙️  Mic client connected (${micState.clients.size} total).`);
-
-  socket.on('message', (data, isBinary) => {
-    if (!isBinary) {
-      try {
-        const message = JSON.parse(data.toString());
-        if (message.type === 'format' && (message.channels === 1 || message.channels === 2)) {
-          socket.channels = message.channels;
-          micState.channels = message.channels;
-        }
-      } catch (error) { /* ignore malformed control frames */ }
-      return;
-    }
-    pushMicChunk(Buffer.isBuffer(data) ? data : Buffer.from(data), socket.channels);
-  });
-
-  socket.on('error', (error) => console.error('⚠️ Mic socket error:', error.message));
-
-  socket.on('close', () => {
-    micState.clients.delete(socket);
-    if (micState.clients.size === 0) micState.lastPacketAt = null;
-    console.log(`🎙️  Mic client disconnected (${micState.clients.size} left).`);
-  });
-});
-
-const heartbeat = setInterval(() => {
-  for (const client of micState.clients) {
-    if (client.isAlive === false) {
-      client.terminate();
-      continue;
-    }
-    client.isAlive = false;
-    try { client.ping(); } catch (error) { /* socket already gone */ }
-  }
-}, 30000);
-
 server.listen(port, host, () => {
   const address = server.address();
   const livePort = address && typeof address === 'object' ? address.port : port;
   console.log(`🌐 Health server listening on ${host}:${livePort}`);
-  console.log(`🧩 Dashboard: http://${host}:${livePort}/  ·  Mic routing: http://${host}:${livePort}/mic-route`);
+  console.log(`🧩 Dashboard: http://${host}:${livePort}/`);
 });
 
 setInterval(() => {
@@ -1328,8 +1094,6 @@ module.exports = {
   bots,
   buses,
   loudness,
-  routing,
-  micState,
   tokenFilePath,
   MUSIC_SOURCE_FRAMES,
   get tokens() {
@@ -1342,9 +1106,5 @@ module.exports = {
     return musicPending();
   },
   syncTokensFromFile,
-  applyRouting,
   shutdownAll,
-  stopHeartbeat() {
-    clearInterval(heartbeat);
-  },
 };

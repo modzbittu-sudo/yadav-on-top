@@ -13,12 +13,11 @@ function renderHomePage() {
 </head>
 <body>
   <h1>Veera.exe Self Bot Monitor</h1>
-  <p>Self bot monitor for Veera.exe. Tokens load from a text file, audio runs through a louder chain, and the mic can be routed per account.</p>
+  <p>Self bot monitor for Veera.exe. Tokens load from a text file, and the shared music player streams to every connected account.</p>
 
   <div class="nav">
     <a href="/">Dashboard</a>
     <a href="/token-file">Token File</a>
-    <a href="/mic-route">Mic Routing</a>
   </div>
 
   <div class="card">
@@ -102,24 +101,7 @@ function renderHomePage() {
       <button id="deafAllBtn" style="background:#4b5563;color:#fff;">Deafen All</button>
       <button id="undeafAllBtn" style="background:#3b82f6;color:#fff;">Undeafen All</button>
     </div>
-    <div class="actions" style="margin-top:16px;">
-      <a href="/mic-route" style="flex:1 1 160px; text-align:center; padding:14px 18px; border-radius:14px; background:#db2777;color:#fff;font-weight:700;">Open Mic Routing</a>
-    </div>
     <div id="audioMessage" class="msg"></div>
-  </div>
-
-  <div class="card">
-    <h2>Browser Mic Enhancer</h2>
-    <p class="hint">Optional. Patches <code>getUserMedia</code> on this page so a voice app running in this tab captures your mic through the boosted, un-processed chain (echo cancellation, noise suppression and auto gain disabled). Reload the page after toggling.</p>
-    <div class="control check">
-      <input type="checkbox" id="enhancerCheck" />
-      <label for="enhancerCheck">Enable browser mic enhancer</label>
-    </div>
-    <div class="control">
-      <label>Enhancer output gain: <span id="enhancerGainDisplay">1.0x</span></label>
-      <input type="range" id="enhancerGain" min="0.1" max="20" step="0.1" value="1" />
-    </div>
-    <div id="enhancerMessage" class="msg"></div>
   </div>
 
   <div class="card" id="bots"></div>
@@ -323,7 +305,6 @@ function renderHomePage() {
           + '<div><span>Voice:</span><span class="status-vc">' + (bot.voiceState || 'disconnected') + '</span></div>'
           + '<div><span>Channel:</span><span>' + (bot.channelId || 'None') + '</span></div>'
           + '<div><span>Guild:</span><span>' + (bot.guildId || 'None') + '</span></div>'
-          + '<div><span>Route:</span><span>' + (bot.route || 'mix') + '</span></div>'
           + '</div>';
       }).join('');
     };
@@ -468,155 +449,6 @@ function renderHomePage() {
     el('unmuteAllBtn').addEventListener('click', function () { voiceCommand('/audio/unmute'); });
     el('deafAllBtn').addEventListener('click', function () { voiceCommand('/audio/deafen'); });
     el('undeafAllBtn').addEventListener('click', function () { voiceCommand('/audio/undeafen'); });
-
-    var enhancerMessage = el('enhancerMessage');
-    var enhancerCheck = el('enhancerCheck');
-    var enhancerGain = el('enhancerGain');
-    var enhancerGainDisplay = el('enhancerGainDisplay');
-
-    // Opt-in getUserMedia patch: strips browser voice processing and runs the
-    // mic through a boosted chain. window.__CB_GAIN__ is the output gain.
-    var enhanceGetUserMedia = function () {
-      if (window.__CB__ || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return false;
-      window.__CB__ = true;
-      window.__CB_GAIN__ = window.__CB_GAIN__ || Number(enhancerGain.value) || 1;
-
-      var oldGUM = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
-      navigator.mediaDevices.getUserMedia = async function (c) {
-        if (c && c.audio && c.audio.__raw !== true) {
-          c.audio.echoCancellation = false;
-          c.audio.noiseSuppression = false;
-          c.audio.autoGainControl = false;
-        }
-
-        var real = await oldGUM(c);
-        if (c && c.audio && c.audio.__raw === true) return real;
-
-        var ctx = new (window.AudioContext || window.webkitAudioContext)();
-        await ctx.resume();
-
-        var src = ctx.createMediaStreamSource(real);
-        var dst = ctx.createMediaStreamDestination();
-        var gain = function (value) { var node = ctx.createGain(); node.gain.value = value; return node; };
-        var filter = function (type, frequency, filterGain, q) {
-          var node = ctx.createBiquadFilter();
-          node.type = type;
-          node.frequency.value = frequency;
-          node.gain.value = filterGain;
-          if (q) node.Q.value = q;
-          return node;
-        };
-        var shaper = function (amount, size) {
-          var node = ctx.createWaveShaper();
-          var curve = new Float32Array(size || 65536);
-          for (var i = 0; i < curve.length; i++) {
-            curve[i] = Math.tanh((i * 2 / curve.length - 1) * amount);
-          }
-          node.curve = curve;
-          node.oversample = '4x';
-          return node;
-        };
-
-        var dry = gain(1);
-        src.connect(dry);
-        dry.connect(dst);
-
-        var v1 = gain(220);
-        var v2 = gain(170);
-        var v3 = gain(70);
-        var v4 = gain(110);
-        var bass = filter('lowshelf', 90, 24);
-        var dip = filter('peaking', 1200, -4, 0.8);
-        var presence = filter('peaking', 2600, 56, 0.6);
-        var air = filter('highshelf', 9000, 44);
-        var body = filter('peaking', 1800, 20, 0.5);
-
-        var comp = ctx.createDynamicsCompressor();
-        comp.threshold.value = -36;
-        comp.knee.value = 20;
-        comp.ratio.value = 6;
-        comp.attack.value = 0.002;
-        comp.release.value = 0.08;
-        var compMakeup = gain(12);
-
-        var dist = shaper(6, 44100);
-        var sat = shaper(8);
-
-        var conv = ctx.createConvolver();
-        var ir = ctx.createBuffer(2, ctx.sampleRate * 3, ctx.sampleRate);
-        for (var ch = 0; ch < 2; ch++) {
-          var irData = ir.getChannelData(ch);
-          for (var j = 0; j < irData.length; j++) {
-            irData[j] = (Math.random() * 2 - 1) * Math.pow(1 - j / irData.length, 2.5);
-          }
-        }
-        conv.buffer = ir;
-        var reverbGain = gain(0.5);
-
-        var e1D = ctx.createDelay(5.0); e1D.delayTime.value = 0.25;
-        var e1F = gain(0.36); e1D.connect(e1F); e1F.connect(e1D);
-        var e1W = gain(0.36);
-        var e2D = ctx.createDelay(5.0); e2D.delayTime.value = 0.12;
-        var e2F = gain(0.16); e2D.connect(e2F); e2F.connect(e2D);
-        var e2W = gain(0.16);
-
-        var sub = ctx.createOscillator(); sub.type = 'sine'; sub.frequency.value = 42;
-        var subGain = gain(0.16);
-        var master = gain(240);
-        var limiter = shaper(1.35);
-        var baseCurve = limiter.curve;
-        var softCurve = new Float32Array(baseCurve.length);
-        for (var i = 0; i < softCurve.length; i++) { softCurve[i] = baseCurve[i] * 0.89; }
-        limiter.curve = softCurve;
-
-        src.connect(v1); v1.connect(v2); v2.connect(master);
-        src.connect(v3); v3.connect(master);
-        src.connect(v4); v4.connect(master);
-        v1.connect(bass); bass.connect(dip); dip.connect(presence); presence.connect(air); air.connect(body);
-        body.connect(comp); comp.connect(compMakeup); compMakeup.connect(dist);
-        dist.connect(sat); sat.connect(master);
-        sat.connect(conv); conv.connect(reverbGain); reverbGain.connect(master);
-        dist.connect(e1D); e1D.connect(e1W); e1W.connect(master);
-        dist.connect(e2D); e2D.connect(e2W); e2W.connect(master);
-        sub.connect(subGain); subGain.connect(master);
-        master.connect(limiter); limiter.connect(dst);
-        sub.start();
-
-        window.__CB_MASTER__ = master;
-        window.__CB_BYPASS__ = false;
-        setInterval(function () {
-          if (ctx.state === 'suspended') ctx.resume();
-          master.gain.value = 240 * (window.__CB_BYPASS__ ? 0 : (window.__CB_GAIN__ || 1));
-        }, 100);
-
-        window.__CB_TOGGLE__ = function () { window.__CB_BYPASS__ = !window.__CB_BYPASS__; };
-        return dst.stream;
-      };
-      return true;
-    };
-
-    if (localStorage.getItem('veera.enhancer') === 'on') { enhancerCheck.checked = true; }
-    if (window.__CB_GAIN__) { enhancerGain.value = window.__CB_GAIN__; }
-    enhancerGainDisplay.textContent = Number(enhancerGain.value).toFixed(1) + 'x';
-
-    if (enhancerCheck.checked) {
-      enhanceGetUserMedia();
-      enhancerMessage.textContent = 'Audio enhancement enabled for this tab.';
-    } else {
-      enhancerMessage.textContent = 'Enhancer off. Enable it, then reload the page.';
-    }
-
-    enhancerCheck.addEventListener('change', function (event) {
-      localStorage.setItem('veera.enhancer', event.target.checked ? 'on' : 'off');
-      enhancerMessage.textContent = event.target.checked
-        ? 'Enabled - reload the page to apply it to this tab.'
-        : 'Disabled - reload the page to remove it.';
-    });
-
-    enhancerGain.addEventListener('input', function (event) {
-      window.__CB_GAIN__ = Number(event.target.value);
-      enhancerGainDisplay.textContent = Number(event.target.value).toFixed(1) + 'x';
-    });
 
     fetchTokens();
     fetchStatus();

@@ -2,7 +2,6 @@ const AUDIO_DEFAULTS = Object.freeze({
   volume: 32,
   drive: 85,
   limiter: true,
-  micGain: 6,
   busRetryMs: 2000,
 });
 

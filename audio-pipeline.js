@@ -12,18 +12,9 @@ const BYTES_PER_FRAME = CHANNELS * SAMPLE_BYTES;
 const BLOCK_FRAMES = 960;          // 20 ms of 48 kHz audio
 const MAX_PENDING_FRAMES = 4800;   // 100 ms head-room per source
 const SILENCE = Buffer.alloc(0);
-const INT16_SAMPLE_BYTES = 2;      // what a browser sends over the mic socket
-const INT16_BYTES_PER_FRAME = CHANNELS * INT16_SAMPLE_BYTES;
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
-}
-
-function hasSignal(buffer) {
-  for (let offset = 0; offset + 3 < buffer.length; offset += SAMPLE_BYTES) {
-    if (buffer.readFloatLE(offset) !== 0) return true;
-  }
-  return false;
 }
 
 // Mixes any number of Float32 LE sources into one continuous Float32 LE stereo
@@ -303,12 +294,9 @@ module.exports = {
   CHANNELS,
   SAMPLE_BYTES,
   BYTES_PER_FRAME,
-  INT16_SAMPLE_BYTES,
-  INT16_BYTES_PER_FRAME,
   BLOCK_FRAMES,
   PcmMixer,
   buildLoudnessFilter,
   createEncoder,
   createDecoder,
-  hasSignal,
 };

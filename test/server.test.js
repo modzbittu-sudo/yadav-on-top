@@ -135,7 +135,6 @@ process.env.MAX_BOTS = '4';
 process.env.TOKEN_FILE_KEY = 'test-file-key';
 
 const app = require('../kolaru');
-const { WebSocket } = require('ws');
 
 let baseUrl = '';
 
@@ -148,7 +147,6 @@ test.before(async () => {
 
 test.after(() => {
   app.shutdownAll();
-  app.stopHeartbeat();
   app.server.close();
   fs.rmSync(workDir, { recursive: true, force: true });
   Module._load = originalLoad;
@@ -211,14 +209,14 @@ test('token file is the only source of tokens', async () => {
   assert.match(rejected.body.error, /token file/i);
 });
 
-test('dashboard, token file and mic routing pages render', async () => {
+test('dashboard and token file pages render', async () => {
   const home = await fetch(baseUrl + '/');
   const homeHtml = await home.text();
   assert.equal(home.status, 200);
   assert.match(homeHtml, /Token Manager/);
   assert.match(homeHtml, /id="addBulkBtn"/, 'bulk add from the dashboard');
   assert.match(homeHtml, /\/token-file/);
-  assert.match(homeHtml, /\/mic-route/);
+  assert.doesNotMatch(homeHtml, /mic-route|Mic Routing/);
   assert.doesNotMatch(homeHtml, /__NEXT__/);
 
   const tokenFile = await fetch(baseUrl + '/token-file');
@@ -229,16 +227,6 @@ test('dashboard, token file and mic routing pages render', async () => {
   assert.match(tokenFileHtml, /id="fileText"/);
   assert.doesNotMatch(tokenFileHtml, /__NEXT__/);
 
-  const mic = await fetch(baseUrl + '/mic-route');
-  const micHtml = await mic.text();
-  assert.equal(mic.status, 200);
-  assert.match(micHtml, /Mic Routing/);
-  assert.match(micHtml, /mic-worklet\.js/);
-
-  const worklet = await fetch(baseUrl + '/mic-worklet.js');
-  const workletJs = await worklet.text();
-  assert.equal(worklet.status, 200);
-  assert.match(workletJs, /registerProcessor\('veera-pcm-tap'/);
 });
 
 test('loudness controls drive the mixer and the ffmpeg chain', async () => {
@@ -293,69 +281,6 @@ test('music is paced to real time even when the decoder bursts', async () => {
   assert.equal(stop.status, 200);
   await new Promise((resolve) => setTimeout(resolve, 50));
   assert.equal(app.musicBuffered, 0, 'stopping clears the mixers');
-});
-
-test('mic audio streams over the websocket into the mix buses', async () => {
-  const socket = new WebSocket(`ws://127.0.0.1:${app.server.address().port}/mic/stream`);
-  await new Promise((resolve, reject) => {
-    socket.once('open', resolve);
-    socket.once('error', reject);
-  });
-
-  socket.send(JSON.stringify({ type: 'format', channels: 1, sampleRate: 48000 }));
-
-  const frame = Buffer.alloc(960 * 2);
-  for (let index = 0; index < 960; index++) frame.writeInt16LE(8000, index * 2);
-  for (let count = 0; count < 5; count++) socket.send(frame);
-
-  // A real mic keeps sending, and refreshGains() runs on a 200 ms timer.
-  const sender = setInterval(() => socket.send(frame), 20);
-  await new Promise((resolve) => setTimeout(resolve, 450));
-  clearInterval(sender);
-
-  const status = await getJson('/mic/status');
-  assert.equal(status.body.clients, 1);
-  assert.ok(status.body.packets >= 5, `expected the frames to be counted (got ${status.body.packets})`);
-  assert.equal(status.body.active, true);
-  assert.equal(status.body.channels, 1);
-  assert.ok(app.buses.mix.mixer.sources.get('mic').received > 0, 'mic reached the mix bus');
-  assert.ok(app.buses.mic.mixer.sources.get('mic').received > 0, 'mic reached the mic-only bus');
-  assert.equal(app.buses.music.mixer.sources.has('mic'), false, 'music-only bus stays clean');
-
-  // Mic activity does not lower music volume.
-  assert.equal(app.buses.mix.mixer.sources.get('music').gain, 30);
-
-  socket.close();
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  assert.equal((await getJson('/mic/status')).body.clients, 0);
-});
-
-test('routing picks the bus each account subscribes to', async () => {
-  for (let attempt = 0; attempt < 40 && app.bots.some((bot) => bot.status !== 'ready'); attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-  assert.ok(app.bots.every((bot) => bot.status === 'ready'), 'stubbed clients reach ready');
-
-  await postJson('/mic/routing', { default: 'music', bots: { 0: 'mic' } });
-  assert.equal(app.routing.default, 'music');
-  assert.equal(app.routing.bots['0'], 'mic');
-
-  const joined = await postJson('/join', { channelId: '123456' });
-  assert.equal(joined.status, 200);
-  assert.equal(joined.body.joinedAll, true);
-
-  const connections = voiceConnections.slice(-2);
-  assert.equal(connections[0].subscribed, app.buses.mic.player, 'account 1 hears the mic only');
-  assert.equal(connections[1].subscribed, app.buses.music.player, 'account 2 hears music only');
-  assert.ok(app.buses.mic.player, 'mic bus has its own player');
-  assert.ok(app.buses.music.player, 'music bus has its own player');
-  assert.notEqual(app.buses.mic.player, app.buses.music.player);
-
-  await postJson('/mic/routing', { bots: { 0: 'off' } });
-  assert.equal(voiceConnections[voiceConnections.length - 2].subscribed, null, 'off unsubscribes');
-
-  await postJson('/mic/routing', { default: 'mix', bots: { 0: 'mix' } });
-  assert.ok(app.buses.mix.player, 'mix bus starts once an account routes to it');
 });
 
 test('token file page is served and shows the add controls', async () => {
@@ -457,7 +382,7 @@ test('voice channels can be listed for an account', async () => {
 
 test('volume changes do not restart the ffmpeg buses', async () => {
   const before = app.buses.mix.encoder;
-  await postJson('/audio/loudness', { volume: 9, micGain: 4 });
+  await postJson('/audio/loudness', { volume: 9 });
   assert.equal(app.buses.mix.encoder, before, 'mixer-side settings are instant, no respawn');
 
   const beforeDrive = app.buses.mix.encoder;

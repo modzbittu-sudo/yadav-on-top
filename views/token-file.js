@@ -25,7 +25,6 @@ function renderTokenFilePage() {
   <div class="nav">
     <a href="/">Dashboard</a>
     <a href="/token-file">Token File</a>
-    <a href="/mic-route">Mic Routing</a>
   </div>
 
   <div class="card">
