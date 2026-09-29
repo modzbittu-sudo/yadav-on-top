@@ -7,7 +7,7 @@ const { PcmMixer, buildLoudnessFilter, createEncoder, createDecoder, BLOCK_FRAME
 const { AUDIO_DEFAULTS, MUSIC_BUFFER } = require('../audio-config');
 
 test('audio config keeps shared playback loud and its buffer thresholds ordered', () => {
-  assert.deepEqual(AUDIO_DEFAULTS, { volume: 32, drive: 85, limiter: true, busRetryMs: 2000 });
+  assert.deepEqual(AUDIO_DEFAULTS, { volume: 32, drive: 85, limiter: true, selfMute: false, busRetryMs: 2000 });
   assert.ok(MUSIC_BUFFER.resumeBytes < MUSIC_BUFFER.pauseBytes);
   assert.ok(MUSIC_BUFFER.pauseBytes < MUSIC_BUFFER.maxFrames * BYTES_PER_FRAME);
 });

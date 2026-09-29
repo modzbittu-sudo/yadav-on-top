@@ -595,7 +595,7 @@ function createBot(token, index) {
 }
 
 const bots = [];
-let globalMute = true;
+let globalMute = AUDIO_DEFAULTS.selfMute;
 let globalDeaf = false;
 
 async function loginBot(bot, index) {
