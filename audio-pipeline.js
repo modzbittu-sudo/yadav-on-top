@@ -265,6 +265,7 @@ function createDecoder(options = {}) {
   const child = spawnImpl(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
   // ffmpeg explains itself on stderr; keep the tail so a failure can say why.
   let stderrTail = '';
+  let stdoutPaused = false;
   const rememberStderr = (data) => {
     stderrTail = (stderrTail + data.toString()).split('\n').filter(Boolean).slice(-4).join(' | ').trim();
     if (onLog) onLog(`decoder: ${data.toString().trim()}`);
@@ -279,7 +280,18 @@ function createDecoder(options = {}) {
 
   return {
     process: child,
+    pause() {
+      if (stdoutPaused || !child.stdout) return;
+      stdoutPaused = true;
+      child.stdout.pause();
+    },
+    resume() {
+      if (!stdoutPaused || !child.stdout) return;
+      stdoutPaused = false;
+      child.stdout.resume();
+    },
     kill() {
+      stdoutPaused = false;
       try { child.kill(); } catch (error) { /* already gone */ }
     },
   };

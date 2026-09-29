@@ -171,3 +171,21 @@ test('createDecoder paces file playback in real time when requested', () => {
   assert.ok(args.includes('-re'));
   assert.ok(args.indexOf('-re') < args.indexOf('-i'), 'real-time input pacing must be set before the input');
 });
+
+test('createDecoder can pause and resume output for downstream backpressure', () => {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = () => {};
+
+  const decoder = createDecoder({
+    ffmpegPath: 'fake-ffmpeg',
+    filePath: 'music.mp3',
+    spawnImpl: () => child,
+  });
+
+  decoder.pause();
+  assert.equal(child.stdout.isPaused(), true);
+  decoder.resume();
+  assert.equal(child.stdout.isPaused(), false);
+});

@@ -195,6 +195,8 @@ function watchTokenFile() {
 // drop audio, and the decoder is throttled against that (see pushMusicChunk).
 // 28800 frames at 48 kHz = 600 ms, i.e. a 230 kB buffer per source.
 const MUSIC_SOURCE_FRAMES = 28800;
+const MUSIC_PAUSE_BYTES = 115200;
+const MUSIC_RESUME_BYTES = 38400;
 const buses = {
   mix: { mixer: new PcmMixer({ maxPendingFrames: MUSIC_SOURCE_FRAMES }), player: null, encoder: null, resource: null, retryTimer: null, broken: false },
   music: { mixer: new PcmMixer({ maxPendingFrames: MUSIC_SOURCE_FRAMES }), player: null, encoder: null, resource: null, retryTimer: null, broken: false },
@@ -343,11 +345,20 @@ function musicPending() {
   );
 }
 
+function releaseMusicPressure() {
+  if (musicPending() <= MUSIC_RESUME_BYTES) musicDecoder?.resume();
+}
+
+// Resume decoding from the audio clock after both music queues drain.
+buses.mix.mixer.onTick = releaseMusicPressure;
+buses.music.mixer.onTick = releaseMusicPressure;
+
 function pushMusicChunk(chunk) {
   if (!chunk || !chunk.length) return;
 
   buses.mix.mixer.writeSource('music', chunk);
   buses.music.mixer.writeSource('music', chunk);
+  if (musicPending() >= MUSIC_PAUSE_BYTES) musicDecoder?.pause();
 }
 
 let musicDecoder = null;
