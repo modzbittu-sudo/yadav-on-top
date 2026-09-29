@@ -251,13 +251,14 @@ function createEncoder(options = {}) {
 
 // Decodes any ffmpeg-readable file into raw Float32 LE stereo 48 kHz PCM.
 function createDecoder(options = {}) {
-  const { ffmpegPath, filePath, spawnImpl = spawn, onLog, onError, onExit, onData, loop = false } = options;
+  const { ffmpegPath, filePath, spawnImpl = spawn, onLog, onError, onExit, onData, loop = false, realtime = false } = options;
 
   if (!ffmpegPath) {
     throw new Error('createDecoder requires an ffmpeg path');
   }
 
   const args = ['-hide_banner', '-loglevel', 'error'];
+  if (realtime) args.push('-re');
   if (loop) args.push('-stream_loop', '-1');
   args.push('-i', filePath, '-f', 'f32le', '-ar', String(SAMPLE_RATE), '-ac', String(CHANNELS), 'pipe:1');
 

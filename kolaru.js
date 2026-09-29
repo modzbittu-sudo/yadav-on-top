@@ -78,8 +78,6 @@ function clampNumber(value, min, max, fallback) {
 
 const autoJoin = (process.env.AUTO_JOIN || 'false').toLowerCase() === 'true';
 const channelIds = parseList(process.env.VOICE_CHANNEL_IDS || process.env.VOICE_CHANNEL_ID || process.env.CHANNEL_ID || '');
-const rawMaxBots = Number(process.env.MAX_BOTS || process.env.MAX_BOT_COUNT || 0);
-const maxBots = Number.isFinite(rawMaxBots) && rawMaxBots > 0 ? Math.floor(rawMaxBots) : Number.MAX_SAFE_INTEGER;
 const host = process.env.HOST || process.env.HOSTNAME || '0.0.0.0';
 const port = Number(process.env.PORT || 3000);
 const keepAliveMs = Number(process.env.KEEPALIVE_MS || 15000);
@@ -136,10 +134,6 @@ function syncTokensFromFile(trigger = 'manual') {
 
   for (const token of added) {
     if (bots.some((bot) => bot.token === token)) continue;
-    if (bots.length >= maxBots) {
-      console.warn(`⚠️ MAX_BOTS (${maxBots}) reached; extra tokens in ${path.basename(tokenFilePath)} are ignored.`);
-      break;
-    }
     const bot = createBot(token, bots.length);
     bots.push(bot);
     console.log(`➕ [${trigger}] Token ${maskToken(token)} added from ${path.basename(tokenFilePath)}.`);
@@ -206,10 +200,6 @@ const buses = {
   music: { mixer: new PcmMixer({ maxPendingFrames: MUSIC_SOURCE_FRAMES }), player: null, encoder: null, resource: null, retryTimer: null, broken: false },
   mic: { mixer: new PcmMixer(), player: null, encoder: null, resource: null, retryTimer: null, broken: false },
 };
-
-// The audio clock is what lets a paused decoder run again.
-buses.mix.mixer.onTick = releaseMusicPressure;
-buses.music.mixer.onTick = releaseMusicPressure;
 
 function currentFilter() {
   return buildLoudnessFilter(loudness);
@@ -344,15 +334,6 @@ function pushMicChunk(chunk, channels) {
   micState.lastPacketAt = Date.now();
 }
 
-// ffmpeg decodes a file far faster than real time, so its output lands in a
-// ffmpeg decodes a file far faster than real time, so it is throttled: after
-// every chunk we check how far ahead the mixers are and pause the decoder until
-// they catch up. This happens per chunk, not per tick - a tick is 20 ms and
-// ffmpeg can push a whole track in that time, which used to mean either skipping
-// the audio or buffering megabytes (and stalling the process with it).
-const MUSIC_PAUSE_BYTES = 115200;  // 300 ms of 48 kHz stereo Float32
-const MUSIC_RESUME_BYTES = 38400;  // 100 ms
-let musicPaused = false;
 let musicError = null;
 
 function musicPending() {
@@ -362,37 +343,11 @@ function musicPending() {
   );
 }
 
-function decoderStdout() {
-  return musicDecoder && musicDecoder.process ? musicDecoder.process.stdout : null;
-}
-
-function pauseMusicDecoder() {
-  const stdout = decoderStdout();
-  if (musicPaused || !stdout) return;
-  musicPaused = true;
-  stdout.pause();
-}
-
-function resumeMusicDecoder() {
-  const stdout = decoderStdout();
-  if (!musicPaused || !stdout) return;
-  musicPaused = false;
-  stdout.resume();
-}
-
 function pushMusicChunk(chunk) {
   if (!chunk || !chunk.length) return;
 
   buses.mix.mixer.writeSource('music', chunk);
   buses.music.mixer.writeSource('music', chunk);
-
-  if (musicPending() >= MUSIC_PAUSE_BYTES) pauseMusicDecoder();
-}
-
-// Runs on the audio clock: let ffmpeg run again once the mixers have room.
-function releaseMusicPressure() {
-  if (!musicPaused) return;
-  if (musicPending() <= MUSIC_RESUME_BYTES) resumeMusicDecoder();
 }
 
 let musicDecoder = null;
@@ -454,6 +409,7 @@ function playGlobalAudio() {
   const decoder = createDecoder({
     ffmpegPath,
     filePath: sharedAudioPath,
+    realtime: true,
     onData: pushMusicChunk,
     onError: (error) => console.error('❌ ffmpeg decoder failed:', error.message),
     onExit: (code, signal, reason) => {
@@ -478,7 +434,6 @@ function playGlobalAudio() {
 
 function stopGlobalAudio() {
   musicError = null;
-  musicPaused = false;
   buses.mix.mixer.clearSource('music');
   buses.music.mixer.clearSource('music');
   if (!musicDecoder) return;
@@ -797,7 +752,7 @@ watchTokenFile();
 
 if (tokens.length > 0) {
   // syncTokensFromFile already logged every account in.
-  console.log(`🚀 ${Math.min(tokens.length, maxBots)} account(s) started from ${tokenFilePath}`);
+  console.log(`🚀 ${tokens.length} account(s) started from ${tokenFilePath}`);
 } else {
   console.log(`🚀 Bot manager started with no accounts. Add tokens to ${tokenFilePath}.`);
 }
@@ -1373,12 +1328,7 @@ module.exports = {
   routing,
   micState,
   tokenFilePath,
-  // Exposed for tests: the decoder is throttled against these, and if the
-  // mixer cannot buffer at least the pause threshold the decoder outruns it and
-  // audio gets dropped instead of slowed down.
   MUSIC_SOURCE_FRAMES,
-  MUSIC_PAUSE_BYTES,
-  MUSIC_RESUME_BYTES,
   get tokens() {
     return tokens;
   },

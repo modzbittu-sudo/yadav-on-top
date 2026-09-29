@@ -131,7 +131,6 @@ Use these values in Render:
   - `HOST=0.0.0.0`
   - `PORT=10000`
   - `TOKENS_FILE=tokens.txt`
-  - `MAX_BOTS=0` (0 = unlimited)
   - `AUDIO_VOLUME=12`, `AUDIO_DRIVE=40`, `AUDIO_LIMITER=true`
   - `MIC_GAIN=6`, `MIC_ROUTE_DEFAULT=mix`
   - `VOICE_CHANNEL_IDS=your-channel-id-here` (only needed with `AUTO_JOIN=true`)

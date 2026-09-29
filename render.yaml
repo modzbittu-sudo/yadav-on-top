@@ -17,8 +17,6 @@ services:
         value: tokens.txt
       - key: TOKEN_FILE_KEY
         sync: false
-      - key: MAX_BOTS
-        value: 0
       - key: AUTO_JOIN
         value: "false"
       - key: AUDIO_VOLUME

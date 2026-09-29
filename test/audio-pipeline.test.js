@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const { PassThrough } = require('node:stream');
 
-const { PcmMixer, buildLoudnessFilter, createEncoder, BLOCK_FRAMES, BYTES_PER_FRAME } = require('../audio-pipeline');
+const { PcmMixer, buildLoudnessFilter, createEncoder, createDecoder, BLOCK_FRAMES, BYTES_PER_FRAME } = require('../audio-pipeline');
 
 // Float32 LE samples: the format the mixer works in.
 function pcm(values) {
@@ -132,4 +132,42 @@ test('createEncoder pipes raw PCM through the injected ffmpeg', async () => {
   assert.equal(args[args.indexOf('-ac') + 1], '2');
   assert.equal(args[args.indexOf('-f') + 1], 'f32le', 'float in, so mixer gains cannot clip');
   assert.ok(args.includes('s16le'), 'Int16 out for Discord');
+});
+
+test('createDecoder loops playback when requested', () => {
+  const spawned = [];
+  const spawnImpl = (command, args) => {
+    spawned.push({ command, args });
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => {};
+    return child;
+  };
+
+  createDecoder({ ffmpegPath: 'fake-ffmpeg', filePath: 'music.mp3', loop: true, spawnImpl });
+
+  const { args } = spawned[0];
+  const loopIndex = args.indexOf('-stream_loop');
+  assert.notEqual(loopIndex, -1);
+  assert.equal(args[loopIndex + 1], '-1', 'playback repeats indefinitely');
+  assert.equal(args[args.indexOf('-i') + 1], 'music.mp3');
+});
+
+test('createDecoder paces file playback in real time when requested', () => {
+  const spawned = [];
+  const spawnImpl = (command, args) => {
+    spawned.push({ command, args });
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => {};
+    return child;
+  };
+
+  createDecoder({ ffmpegPath: 'fake-ffmpeg', filePath: 'music.mp3', realtime: true, spawnImpl });
+
+  const { args } = spawned[0];
+  assert.ok(args.includes('-re'));
+  assert.ok(args.indexOf('-re') < args.indexOf('-i'), 'real-time input pacing must be set before the input');
 });
