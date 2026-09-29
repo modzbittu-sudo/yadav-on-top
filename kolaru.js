@@ -1059,14 +1059,14 @@ const server = http.createServer(async (req, res) => {
       sendJSON(res, 400, { error: 'No audio uploaded yet' });
       return;
     }
+    // Start the output path before decoding so startup audio has an active bus.
+    startBus('mix');
+    startBus('music');
+    applyRouting();
     if (!playGlobalAudio()) {
       sendJSON(res, 500, { error: 'Could not start playback' });
       return;
     }
-    // Decode in real time up front so playback is live before anyone joins.
-    startBus('mix');
-    startBus('music');
-    applyRouting();
     sendJSON(res, 200, { status: 'playing', filter: currentFilter() });
     return;
   }
