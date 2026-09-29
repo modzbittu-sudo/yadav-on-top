@@ -2,27 +2,52 @@ require('dotenv').config();
 
 const { Client } = require('discord.js-selfbot-v13');
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, NoSubscriberBehavior, StreamType, VoiceConnectionStatus, entersState } = require('@discordjs/voice');
-const { Readable, PassThrough } = require('stream');
-const { spawn } = require('child_process');
-const ffmpeg = require('ffmpeg-static');
+const { WebSocketServer } = require('ws');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { parseTokenList, readTokenFile, addTokenToList, persistTokenList } = require('./token-store');
+const ffmpeg = require('ffmpeg-static');
+const { PcmMixer, buildLoudnessFilter, createEncoder, createDecoder, INT16_SAMPLE_BYTES, INT16_BYTES_PER_FRAME } = require('./audio-pipeline');
+const { readTokenFile, writeTokenFile, diffTokenLists, mergeTokenFile } = require('./token-store');
+const { renderHomePage } = require('./views/home');
+const { renderMicRoutePage } = require('./views/mic-route');
+const { renderTokenFilePage } = require('./views/token-file');
+
+const MIC_WORKLET_SOURCE = `class VeeraPcmTap extends AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    var opts = options.processorOptions || {};
+    this.blockFrames = opts.blockFrames || 960;
+    this.buffer = new Float32Array(this.blockFrames);
+    this.offset = 0;
+  }
+  process(inputs) {
+    var input = inputs[0];
+    var channel = input && input[0];
+    if (!channel) return true;
+    for (var i = 0; i < channel.length; i++) {
+      this.buffer[this.offset++] = channel[i];
+      if (this.offset === this.blockFrames) {
+        var pcm = new Int16Array(this.blockFrames);
+        for (var j = 0; j < this.blockFrames; j++) {
+          var sample = this.buffer[j] < -1 ? -1 : (this.buffer[j] > 1 ? 1 : this.buffer[j]);
+          pcm[j] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+        }
+        this.port.postMessage({ type: 'pcm', buffer: pcm.buffer }, [pcm.buffer]);
+        this.offset = 0;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('veera-pcm-tap', VeeraPcmTap);
+`;
 
 function parseList(value) {
   return (value || '')
     .split(',')
     .map((item) => item.trim())
     .filter(Boolean);
-}
-
-function createSilentStream() {
-  return new Readable({
-    read(size) {
-      this.push(Buffer.alloc(1920));
-    }
-  });
 }
 
 function parseJSONBody(req) {
@@ -40,184 +65,451 @@ function parseJSONBody(req) {
   });
 }
 
-async function parseRequestBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on('data', (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
-    req.on('end', () => {
-      try {
-        const raw = Buffer.concat(chunks).toString('utf8');
-        if (!raw) {
-          resolve({});
-          return;
-        }
-
-        const contentType = (req.headers['content-type'] || '').toLowerCase();
-        if (contentType.includes('application/json')) {
-          resolve(JSON.parse(raw || '{}'));
-          return;
-        }
-
-        if (contentType.includes('application/x-www-form-urlencoded')) {
-          const params = new URLSearchParams(raw);
-          const parsed = {};
-          for (const [key, value] of params.entries()) parsed[key] = value;
-          resolve(parsed);
-          return;
-        }
-
-        if (contentType.includes('multipart/form-data')) {
-          const boundaryMatch = contentType.match(/boundary=(?:"([^"]+)"|([^;]+))/i);
-          const boundary = boundaryMatch ? (boundaryMatch[1] || boundaryMatch[2]) : null;
-          if (!boundary) {
-            resolve({});
-            return;
-          }
-
-          const parsed = {};
-          const segments = raw.split(`--${boundary}`);
-          for (const segment of segments) {
-            const block = segment.trim();
-            if (!block || block === '--') continue;
-            const headerEnd = block.indexOf('\r\n\r\n');
-            if (headerEnd < 0) continue;
-            const headers = block.slice(0, headerEnd);
-            const content = block.slice(headerEnd + 4).replace(/\r\n--$/, '').replace(/--$/, '').trim();
-            const dispositionMatch = headers.match(/content-disposition:\s*form-data;\s*name="([^"]+)"(?:;\s*filename="([^"]*)")?/i);
-            if (!dispositionMatch) continue;
-            const name = dispositionMatch[1];
-            const filename = dispositionMatch[2] || '';
-            if (!filename) {
-              parsed[name] = content;
-            } else {
-              parsed.file = content;
-              parsed.fileName = filename;
-            }
-          }
-
-          const tokenText = String(parsed.tokens || parsed.file || parsed.text || parsed.contents || '');
-          const maxBotsValue = Number(parsed.maxBots || parsed.maxbots || '');
-          resolve({ tokens: tokenText, maxBots: Number.isFinite(maxBotsValue) && maxBotsValue > 0 ? Math.floor(maxBotsValue) : Number.MAX_SAFE_INTEGER });
-          return;
-        }
-
-        try {
-          resolve(JSON.parse(raw || '{}'));
-        } catch (error) {
-          const params = new URLSearchParams(raw);
-          const parsed = {};
-          for (const [key, value] of params.entries()) parsed[key] = value;
-          resolve(parsed);
-        }
-      } catch (error) {
-        reject(error);
-      }
-    });
-    req.on('error', reject);
-  });
+function sendJSON(res, status, payload) {
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(payload));
 }
 
-function loadStartupTokens() {
-  const candidates = [
-    process.env.BOT_TOKENS || '',
-    process.env.BOT_TOKEN || '',
-    fs.existsSync(path.join(process.cwd(), '.env')) ? fs.readFileSync(path.join(process.cwd(), '.env'), 'utf8') : '',
-    fs.existsSync(path.join(process.cwd(), 'tokens.txt')) ? fs.readFileSync(path.join(process.cwd(), 'tokens.txt'), 'utf8') : '',
-    fs.existsSync(path.join(process.cwd(), 'BOT_TOKENS.txt')) ? fs.readFileSync(path.join(process.cwd(), 'BOT_TOKENS.txt'), 'utf8') : '',
-    fs.existsSync(path.join(process.cwd(), 'bot_tokens.txt')) ? fs.readFileSync(path.join(process.cwd(), 'bot_tokens.txt'), 'utf8') : '',
-  ];
-
-  const all = candidates.flatMap((entry) => Array.isArray(entry) ? entry : [entry]);
-  return parseTokenList(all);
+function clampNumber(value, min, max, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
 }
 
-const rawTokens = process.env.BOT_TOKENS || process.env.BOT_TOKEN || '';
-let tokens = loadStartupTokens();
 const autoJoin = (process.env.AUTO_JOIN || 'false').toLowerCase() === 'true';
-const rawChannels = process.env.VOICE_CHANNEL_IDS || process.env.VOICE_CHANNEL_ID || process.env.CHANNEL_ID || '';
-const channelIds = parseList(rawChannels);
+const channelIds = parseList(process.env.VOICE_CHANNEL_IDS || process.env.VOICE_CHANNEL_ID || process.env.CHANNEL_ID || '');
 const rawMaxBots = Number(process.env.MAX_BOTS || process.env.MAX_BOT_COUNT || 0);
 const maxBots = Number.isFinite(rawMaxBots) && rawMaxBots > 0 ? Math.floor(rawMaxBots) : Number.MAX_SAFE_INTEGER;
 const host = process.env.HOST || process.env.HOSTNAME || '0.0.0.0';
 const port = Number(process.env.PORT || 3000);
 const keepAliveMs = Number(process.env.KEEPALIVE_MS || 15000);
-const envFilePath = path.join(process.cwd(), '.env');
+const ffmpegPath = process.env.FFMPEG_PATH || ffmpeg;
+const sharedAudioPath = path.resolve(process.cwd(), process.env.AUDIO_FILE || './shared_audio.mp3');
+const tokenFilePath = path.resolve(process.cwd(), process.env.TOKENS_FILE || 'tokens.txt');
+const tokenFileEnv = process.env.BOT_TOKENS || process.env.BOT_TOKEN || '';
+// Optional gate for the endpoints that can read or write the raw token file.
+const tokenFileKey = (process.env.TOKEN_FILE_KEY || '').trim();
 
-if (tokens.length === 0) {
-  console.warn('⚠️ No BOT_TOKENS loaded at startup. Add one from the website and it will log in automatically.');
-} else {
-  console.log(`🔢 Using up to ${Math.min(tokens.length, maxBots)} bot token(s) from BOT_TOKENS/BOT_TOKEN`);
+const loudness = {
+  volume: clampNumber(process.env.AUDIO_VOLUME, 0.5, 100, 12),
+  drive: clampNumber(process.env.AUDIO_DRIVE, 0, 100, 40),
+  limiter: (process.env.AUDIO_LIMITER || 'true').toLowerCase() !== 'false',
+  targetLufs: process.env.AUDIO_TARGET_LUFS ? clampNumber(process.env.AUDIO_TARGET_LUFS, -31, -4, null) : null,
+  duckMusic: (process.env.AUDIO_DUCK_MUSIC || 'true').toLowerCase() !== 'false',
+  duckLevel: clampNumber(process.env.AUDIO_DUCK_LEVEL, 0, 1, 0.35),
+  micGain: clampNumber(process.env.MIC_GAIN, 0.1, 20, 6),
+};
+
+const routing = {
+  default: ['mix', 'music', 'mic', 'off'].includes(process.env.MIC_ROUTE_DEFAULT) ? process.env.MIC_ROUTE_DEFAULT : 'mix',
+  bots: {},
+};
+
+const micState = { clients: new Set(), packets: 0, lastPacketAt: null, channels: 1 };
+const tokenSync = { lastSyncAt: null, lastTrigger: 'startup', added: 0, removed: 0 };
+let tokens = [];
+
+// --- TOKEN FILE IS THE ONLY SOURCE OF TRUTH -------------------------------
+function seedTokenFile() {
+  if (readTokenFile(tokenFilePath).length > 0 || !tokenFileEnv.trim()) return;
+
+  try {
+    writeTokenFile(tokenFilePath, tokenFileEnv);
+    console.log(`📝 Seeded ${tokenFilePath} from BOT_TOKENS/BOT_TOKEN (one-time migration).`);
+  } catch (error) {
+    console.warn(`⚠️ Could not write ${tokenFilePath}: ${error.message}`);
+  }
 }
 
-// --- SINGLE GLOBAL AUDIO PLAYER (perfect sync for all bots) ---
-let globalVolume = 24.0;
-let globalDistortion = 26;
-let globalMute = false;
-let globalDeaf = false;
-let globalAudioProcess = null;
+function syncTokensFromFile(trigger = 'manual') {
+  const fileTokens = readTokenFile(tokenFilePath);
+  const { added, removed } = diffTokenLists(tokens, fileTokens);
+  tokens = fileTokens;
 
-const globalAudioPlayer = createAudioPlayer({
-  behaviors: { noSubscriber: NoSubscriberBehavior.Play }
-});
-
-globalAudioPlayer.on('error', error => {
-  console.error(`❌ Global Audio Player Error:`, error.message);
-  playGlobalSilence();
-});
-
-function playGlobalSilence() {
-  if (globalAudioProcess) {
-    try { globalAudioProcess.kill(); } catch(e) {}
-    globalAudioProcess = null;
+  for (const token of removed) {
+    const index = bots.findIndex((bot) => bot.token === token);
+    if (index === -1) continue;
+    const [bot] = bots.splice(index, 1);
+    console.log(`🗑️ [${trigger}] Token ${maskToken(token)} removed from ${path.basename(tokenFilePath)}; logging out.`);
+    bot.shutdown();
   }
-  const silentStream = createSilentStream();
-  const resource = createAudioResource(silentStream, {
-    inputType: StreamType.Raw,
-    inlineVolume: true,
+
+  for (const token of added) {
+    if (bots.some((bot) => bot.token === token)) continue;
+    if (bots.length >= maxBots) {
+      console.warn(`⚠️ MAX_BOTS (${maxBots}) reached; extra tokens in ${path.basename(tokenFilePath)} are ignored.`);
+      break;
+    }
+    const bot = createBot(token, bots.length);
+    bots.push(bot);
+    console.log(`➕ [${trigger}] Token ${maskToken(token)} added from ${path.basename(tokenFilePath)}.`);
+    loginBot(bot, bots.length - 1);
+  }
+
+  tokenSync.lastSyncAt = new Date().toISOString();
+  tokenSync.lastTrigger = trigger;
+  tokenSync.added = added.length;
+  tokenSync.removed = removed.length;
+
+  if (added.length === 0 && removed.length === 0) {
+    console.log(`👀 [${trigger}] No token file changes (${tokens.length} token(s)).`);
+  }
+
+  return { added: added.length, removed: removed.length, count: tokens.length };
+}
+
+function maskToken(token) {
+  const value = String(token || '');
+  if (value.length <= 12) return '***';
+  return `${value.slice(0, 8)}...${value.slice(-4)}`;
+}
+
+function tokenFileAllowed(req) {
+  if (!tokenFileKey) return true;
+  const provided = req.headers['x-token-key'];
+  return typeof provided === 'string' && provided === tokenFileKey;
+}
+
+function describeTokenFile() {
+  return {
+    path: tokenFilePath,
+    exists: fs.existsSync(tokenFilePath),
+    count: tokens.length,
+    lastSyncAt: tokenSync.lastSyncAt,
+    lastTrigger: tokenSync.lastTrigger,
+    added: tokenSync.added,
+    removed: tokenSync.removed,
+    protected: Boolean(tokenFileKey),
+  };
+}
+
+function watchTokenFile() {
+  fs.watchFile(tokenFilePath, { interval: 2000 }, (current, previous) => {
+    if (current.mtimeMs === previous.mtimeMs && current.size === previous.size) return;
+    clearTimeout(watchTokenFile.timer);
+    watchTokenFile.timer = setTimeout(() => {
+      console.log(`📄 ${path.basename(tokenFilePath)} changed on disk.`);
+      syncTokensFromFile('file-watch');
+    }, 400);
   });
-  resource.volume.setVolume(0.0);
-  globalAudioPlayer.play(resource);
+}
+
+// --- AUDIO BUSES ----------------------------------------------------------
+// Every bus is a live PCM mixer -> ffmpeg loudness chain -> audio player.
+// Sources that run dry are padded with silence, so a bus never stalls.
+// The mixers hold a few hundred ms of source so a fast decoder never has to
+// drop audio, and the decoder is throttled against that (see pushMusicChunk).
+// 28800 frames at 48 kHz = 600 ms, i.e. a 230 kB buffer per source.
+const MUSIC_SOURCE_FRAMES = 28800;
+const buses = {
+  mix: { mixer: new PcmMixer({ maxPendingFrames: MUSIC_SOURCE_FRAMES }), player: null, encoder: null, resource: null, retryTimer: null, broken: false },
+  music: { mixer: new PcmMixer({ maxPendingFrames: MUSIC_SOURCE_FRAMES }), player: null, encoder: null, resource: null, retryTimer: null, broken: false },
+  mic: { mixer: new PcmMixer(), player: null, encoder: null, resource: null, retryTimer: null, broken: false },
+};
+
+// The audio clock is what lets a paused decoder run again.
+buses.mix.mixer.onTick = releaseMusicPressure;
+buses.music.mixer.onTick = releaseMusicPressure;
+
+function currentFilter() {
+  return buildLoudnessFilter(loudness);
+}
+
+function stopBus(name) {
+  const bus = buses[name];
+  if (!bus) return;
+
+  bus.mixer.unpipe();
+  bus.mixer.stop();
+  if (bus.encoder) {
+    bus.encoder.kill();
+    bus.encoder = null;
+  }
+  if (bus.player) {
+    try { bus.player.stop(true); } catch (error) { /* already stopped */ }
+  }
+  bus.resource = null;
+}
+
+function startBus(name) {
+  const bus = buses[name];
+  if (!bus || bus.encoder) return false;
+
+  try {
+    if (!bus.player) {
+      bus.player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
+      bus.player.on('error', (error) => console.error(`❌ Bus ${name} player error:`, error.message));
+    }
+
+    // The handlers ignore a stale encoder, so an intentional restart (kill on
+    // stopBus) never looks like a crash and never triggers the retry loop.
+    const encoder = createEncoder({
+      ffmpegPath,
+      filter: currentFilter(),
+      label: `bus ${name}`,
+      onLog: (message) => message && console.error(`FFmpeg [${name}]:`, message),
+      onError: (error) => {
+        if (bus.encoder !== encoder) return;
+        bus.encoder = null;
+        bus.broken = true;
+        console.error(`❌ ffmpeg encoder for bus "${name}" failed: ${error.message}`);
+        scheduleBusRetry(name);
+      },
+      onExit: (code) => {
+        if (bus.encoder !== encoder) return;
+        bus.encoder = null;
+        bus.broken = true;
+        console.error(`⚠️ ffmpeg encoder for bus "${name}" exited with code ${code}.`);
+        scheduleBusRetry(name);
+      },
+    });
+
+    bus.encoder = encoder;
+    bus.mixer.start();
+    bus.mixer.pipe(encoder.input);
+    bus.resource = createAudioResource(encoder.output, {
+      inputType: StreamType.Raw,
+      inlineVolume: false,
+    });
+    bus.player.play(bus.resource);
+    bus.broken = false;
+    console.log(`🔊 Bus "${name}" running (${currentFilter()}).`);
+    return true;
+  } catch (error) {
+    bus.broken = true;
+    console.error(`❌ Could not start bus "${name}":`, error.message);
+    scheduleBusRetry(name);
+    return false;
+  }
+}
+
+function scheduleBusRetry(name) {
+  const bus = buses[name];
+  if (!bus || bus.retryTimer) return;
+  bus.retryTimer = setTimeout(() => {
+    bus.retryTimer = null;
+    if (!bus.broken) return;
+    console.log(`🔁 Retrying bus "${name}"...`);
+    startBus(name);
+  }, 15000);
+}
+
+function applyLoudnessFilter() {
+  for (const name of Object.keys(buses)) {
+    if (!buses[name].encoder) continue;
+    stopBus(name);
+    startBus(name);
+  }
+  applyRouting();
+}
+
+function isMicActive() {
+  return Boolean(micState.lastPacketAt) && Date.now() - micState.lastPacketAt < 250;
+}
+
+function refreshGains() {
+  const ducked = isMicActive() && loudness.duckMusic;
+  const musicGain = loudness.volume * (ducked ? loudness.duckLevel : 1);
+
+  buses.mix.mixer.setSourceGain('music', musicGain);
+  buses.music.mixer.setSourceGain('music', musicGain);
+  buses.mix.mixer.setSourceGain('mic', loudness.micGain);
+  buses.mic.mixer.setSourceGain('mic', loudness.micGain);
+}
+
+// The browser sends Int16 mono; the mixer works in float stereo.
+function micToStereoFloat(buffer, channels) {
+  const samples = Math.floor(buffer.length / INT16_SAMPLE_BYTES);
+  const alreadyStereo = channels === 2 && samples % 2 === 0;
+  const out = Buffer.allocUnsafe(alreadyStereo ? samples * 4 : samples * 8);
+
+  for (let index = 0; index < samples; index++) {
+    const sample = buffer.readInt16LE(index * INT16_SAMPLE_BYTES) / 32768;
+    if (alreadyStereo) {
+      out.writeFloatLE(sample, index * 4);
+    } else {
+      out.writeFloatLE(sample, index * 8);
+      out.writeFloatLE(sample, index * 8 + 4);
+    }
+  }
+  return out;
+}
+
+function pushMicChunk(chunk, channels) {
+  if (!chunk || !chunk.length) return;
+  const stereo = micToStereoFloat(chunk, channels || 1);
+  buses.mix.mixer.writeSource('mic', stereo);
+  buses.mic.mixer.writeSource('mic', stereo);
+  micState.packets += 1;
+  micState.lastPacketAt = Date.now();
+}
+
+// ffmpeg decodes a file far faster than real time, so its output lands in a
+// ffmpeg decodes a file far faster than real time, so it is throttled: after
+// every chunk we check how far ahead the mixers are and pause the decoder until
+// they catch up. This happens per chunk, not per tick - a tick is 20 ms and
+// ffmpeg can push a whole track in that time, which used to mean either skipping
+// the audio or buffering megabytes (and stalling the process with it).
+const MUSIC_PAUSE_BYTES = 115200;  // 300 ms of 48 kHz stereo Float32
+const MUSIC_RESUME_BYTES = 38400;  // 100 ms
+let musicPaused = false;
+let musicError = null;
+
+function musicPending() {
+  return Math.max(
+    buses.mix.mixer.sourcePending('music'),
+    buses.music.mixer.sourcePending('music'),
+  );
+}
+
+function decoderStdout() {
+  return musicDecoder && musicDecoder.process ? musicDecoder.process.stdout : null;
+}
+
+function pauseMusicDecoder() {
+  const stdout = decoderStdout();
+  if (musicPaused || !stdout) return;
+  musicPaused = true;
+  stdout.pause();
+}
+
+function resumeMusicDecoder() {
+  const stdout = decoderStdout();
+  if (!musicPaused || !stdout) return;
+  musicPaused = false;
+  stdout.resume();
+}
+
+function pushMusicChunk(chunk) {
+  if (!chunk || !chunk.length) return;
+
+  buses.mix.mixer.writeSource('music', chunk);
+  buses.music.mixer.writeSource('music', chunk);
+
+  if (musicPending() >= MUSIC_PAUSE_BYTES) pauseMusicDecoder();
+}
+
+// Runs on the audio clock: let ffmpeg run again once the mixers have room.
+function releaseMusicPressure() {
+  if (!musicPaused) return;
+  if (musicPending() <= MUSIC_RESUME_BYTES) resumeMusicDecoder();
+}
+
+let musicDecoder = null;
+
+// Decodes half a second to check ffmpeg can actually read the file, and
+// returns a human-readable reason when it cannot.
+function probeAudio(filePath) {
+  return new Promise((resolve) => {
+    if (!fs.existsSync(filePath)) {
+      resolve('the file is missing');
+      return;
+    }
+
+    const size = fs.statSync(filePath).size;
+    if (size === 0) {
+      resolve('the file is empty (0 bytes)');
+      return;
+    }
+
+    let child;
+    try {
+      child = require('child_process').spawn(ffmpegPath, [
+        '-hide_banner', '-loglevel', 'error', '-t', '0.5', '-i', filePath, '-f', 'null', '-',
+      ], { stdio: ['ignore', 'ignore', 'pipe'] });
+    } catch (error) {
+      resolve(`ffmpeg could not start: ${error.message}`);
+      return;
+    }
+
+    let reason = '';
+    child.stderr.on('data', (data) => {
+      reason = (reason + data.toString()).split('\n').filter(Boolean).slice(-2).join(' ').trim();
+    });
+    child.on('error', (error) => resolve(`ffmpeg could not start: ${error.message}`));
+    child.on('close', (code) => {
+      if (code === 0) {
+        resolve(null);
+        return;
+      }
+      // ffmpeg names the file in its complaint; the user does not care about our
+      // temp path, only what is wrong with the audio.
+      const clean = reason
+        .split(filePath).join('the file')
+        .split(path.basename(filePath)).join('the file')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      resolve(clean || (size < 4096
+        ? 'it is not audio data (too small and ffmpeg reported nothing)'
+        : `ffmpeg exited with code ${code}`));
+    });
+  });
 }
 
 function playGlobalAudio() {
-  if (!fs.existsSync('./shared_audio.mp3')) return false;
+  if (!fs.existsSync(sharedAudioPath)) return false;
+  stopGlobalAudio();
 
-  if (globalAudioProcess) {
-    try { globalAudioProcess.kill(); } catch(e) {}
-  }
+  const decoder = createDecoder({
+    ffmpegPath,
+    filePath: sharedAudioPath,
+    onData: pushMusicChunk,
+    onError: (error) => console.error('❌ ffmpeg decoder failed:', error.message),
+    onExit: (code, signal, reason) => {
+      // Stopping playback kills the decoder on purpose; that is not a failure.
+      if (musicDecoder !== decoder) return;
+      musicDecoder = null;
+      if (code === 0) return;
 
-  const distortionLevel = Math.max(1, Number(globalDistortion) || 26);
-  const boostedVolume = Math.max(2.0, globalVolume * 1.8);
-  const filterChain = `volume=${boostedVolume},highpass=f=30,lowpass=f=20000,eq=band=120:gain=6:width_type=h:bandwidth=80,acrusher=level_in=${distortionLevel}:level_out=12:bits=2:mode=log:mix=1,volume=${boostedVolume}`;
-
-  globalAudioProcess = spawn(ffmpeg, [
-    '-i', './shared_audio.mp3',
-    '-af', filterChain,
-    '-f', 's16le',
-    '-ar', '48000',
-    '-ac', '2',
-    '-loglevel', 'error',
-    'pipe:1'
-  ], { stdio: ['pipe', 'pipe', 'pipe'] });
-
-  globalAudioProcess.stderr.on('data', d => console.log('FFmpeg:', d.toString().trim()));
-
-  const resource = createAudioResource(globalAudioProcess.stdout, {
-    inputType: StreamType.Raw,
-    inlineVolume: false,
+      probeAudio(sharedAudioPath).then((problem) => {
+        musicError = problem || reason || `ffmpeg exited with code ${code}${signal ? ` (${signal})` : ''}`;
+        console.error(
+          `❌ Could not play ${path.basename(sharedAudioPath)}: ${musicError}. `
+          + 'Upload a different file - the previous upload was kept.',
+        );
+      });
+    },
   });
-
-  globalAudioPlayer.play(resource);
-
-  globalAudioProcess.on('close', () => {
-    globalAudioProcess = null;
-  });
+  musicDecoder = decoder;
 
   return true;
 }
 
-playGlobalSilence();
+function stopGlobalAudio() {
+  musicError = null;
+  musicPaused = false;
+  buses.mix.mixer.clearSource('music');
+  buses.music.mixer.clearSource('music');
+  if (!musicDecoder) return;
+  musicDecoder.kill();
+  musicDecoder = null;
+}
 
+const ROUTE_MODES = ['mix', 'music', 'mic', 'off'];
+
+function routeForBot(index) {
+  const mode = routing.bots[index] || routing.default;
+  return ROUTE_MODES.includes(mode) ? mode : 'mix';
+}
+
+function applyRouting() {
+  bots.forEach((bot, index) => {
+    const connection = bot.getConnection();
+    if (!connection) return;
+
+    const mode = routeForBot(index);
+    if (mode === 'off') {
+      try { connection.subscribe(null); } catch (error) { /* connection gone */ }
+      return;
+    }
+
+    startBus(mode);
+    try { connection.subscribe(buses[mode].player); } catch (error) { /* connection gone */ }
+  });
+}
+
+// --- BOTS -----------------------------------------------------------------
 function createBot(token, index) {
   const client = new Client({ checkUpdate: false });
   let voiceConnection = null;
@@ -249,16 +541,24 @@ function createBot(token, index) {
     status: 'offline',
     voiceState: 'disconnected',
     lastError: null,
+    getConnection() {
+      return voiceConnection;
+    },
+    getTag() {
+      return client.user ? client.user.tag : null;
+    },
     async joinChannel(targetChannelId, targetGuildId) {
       if (!targetChannelId) return false;
       if (voiceConnection && bot.channelId === targetChannelId && voiceConnection.state?.status === 'ready') {
         console.log(`ℹ️ [Bot ${index + 1}] Already in channel ${targetChannelId}`);
         bot.voiceState = 'connected';
+        applyRoutingFor(bot, index, voiceConnection);
         return true;
       }
 
       if (voiceConnection) {
-        try { voiceConnection.destroy(); } catch (e) {}
+        try { voiceConnection.destroy(); } catch (error) { /* already gone */ }
+        voiceConnection = null;
       }
 
       bot.voiceState = 'connecting';
@@ -269,13 +569,32 @@ function createBot(token, index) {
       try {
         await waitForReady();
 
-        console.log(`🔍 [Bot ${index + 1}] Fetching channel ${targetChannelId} and guild ${targetGuildId || 'none'}`);
+        // A 403 here means the account is not in that server (or cannot see the
+        // channel), which is a very different problem from a wrong channel id.
+        let fetchError = null;
         const channel = await client.channels.fetch(targetChannelId).catch((error) => {
-          console.error(`❌ [Bot ${index + 1}] Channel fetch failed:`, error?.message || error);
+          fetchError = error;
           return null;
         });
+
         if (!channel || !channel.isVoice?.()) {
-          const message = `Channel ${targetChannelId} was not found or is not a voice channel`;
+          const guildCount = client.guilds?.cache?.size ?? 0;
+          const code = fetchError?.code ?? fetchError?.status;
+          const text = String(fetchError?.message || '');
+          let message;
+
+          if (/Missing Access|403/i.test(text) || code === 403) {
+            message = `Missing Access: this account cannot see that channel. It is probably not in that `
+              + `server - join it first, or pick a channel in a server it is in.`;
+          } else if (/Unknown Channel|404/i.test(text) || code === 404) {
+            message = `Unknown Channel: ${targetChannelId} does not exist. Copy the channel id again.`;
+          } else if (channel) {
+            message = `Channel ${targetChannelId} is not a voice channel.`;
+          } else {
+            message = `Channel ${targetChannelId} could not be read${fetchError ? `: ${text}` : ''}. `
+              + `This account is in ${guildCount} server(s).`;
+          }
+
           bot.lastError = message;
           bot.voiceState = 'failed';
           console.error(`❌ [Bot ${index + 1}] ${message}`);
@@ -284,13 +603,13 @@ function createBot(token, index) {
 
         const guild = targetGuildId
           ? client.guilds.cache.get(targetGuildId) || await client.guilds.fetch(targetGuildId).catch((error) => {
-              console.error(`❌ [Bot ${index + 1}] Guild fetch failed:`, error?.message || error);
-              return null;
-            })
+            console.error(`❌ [Bot ${index + 1}] Guild fetch failed:`, error?.message || error);
+            return null;
+          })
           : channel.guild || await client.guilds.fetch(channel.guildId || channel.guild?.id).catch((error) => {
-              console.error(`❌ [Bot ${index + 1}] Guild fetch failed:`, error?.message || error);
-              return null;
-            });
+            console.error(`❌ [Bot ${index + 1}] Guild fetch failed:`, error?.message || error);
+            return null;
+          });
         if (!guild) {
           const message = `Could not resolve guild for ${channel.id}`;
           bot.lastError = message;
@@ -313,7 +632,7 @@ function createBot(token, index) {
               selfMute: globalMute,
             });
 
-            voiceConnection.subscribe(globalAudioPlayer);
+            applyRoutingFor(bot, index, voiceConnection);
 
             await entersState(voiceConnection, VoiceConnectionStatus.Ready, 30000);
             joined = true;
@@ -338,6 +657,10 @@ function createBot(token, index) {
         bot.lastError = null;
 
         voiceConnection.on('stateChange', (oldState, newState) => {
+          // Discord re-emits stateChange for every heartbeat and every audio
+          // update; only real transitions are worth a log line.
+          if (oldState.status === newState.status) return;
+
           console.log(`🔌 [Bot ${index + 1}] Voice state: ${oldState.status} -> ${newState.status}`);
           if (newState.status === 'disconnected' || newState.status === 'destroyed') {
             bot.voiceState = 'disconnected';
@@ -350,10 +673,13 @@ function createBot(token, index) {
           }
         });
 
+        // Progress ping: one line per account per hour, not per keepalive.
+        let lastKeepAliveLog = 0;
         setInterval(() => {
-          if (voiceConnection && voiceConnection.state.status === 'ready') {
-            console.log(`💚 [Bot ${index + 1}] Voice channel still active`);
-          }
+          if (!voiceConnection || voiceConnection.state.status !== 'ready') return;
+          if (Date.now() - lastKeepAliveLog < 3600000) return;
+          lastKeepAliveLog = Date.now();
+          console.log(`💚 [Bot ${index + 1}] Still connected`);
         }, keepAliveMs);
         return true;
       } catch (error) {
@@ -364,6 +690,7 @@ function createBot(token, index) {
         return false;
       }
     },
+
     leaveChannel() {
       if (voiceConnection) {
         console.log(`🟡 [Bot ${index + 1}] Leaving voice channel ${bot.channelId}`);
@@ -377,8 +704,8 @@ function createBot(token, index) {
       try {
         if (voiceConnection) voiceConnection.destroy();
         client.destroy();
-      } catch (e) {}
-    }
+      } catch (error) { /* already gone */ }
+    },
   };
 
   client.on('ready', async () => {
@@ -406,7 +733,22 @@ function createBot(token, index) {
   return bot;
 }
 
-const bots = tokens.slice(0, maxBots).map((token, index) => createBot(token, index));
+function applyRoutingFor(bot, index, connection) {
+  if (!connection) return;
+
+  const mode = routeForBot(index);
+  if (mode === 'off') {
+    try { connection.subscribe(null); } catch (error) { /* connection gone */ }
+    return;
+  }
+
+  startBus(mode);
+  try { connection.subscribe(buses[mode].player); } catch (error) { /* connection gone */ }
+}
+
+const bots = [];
+let globalMute = true;
+let globalDeaf = false;
 
 async function loginBot(bot, index) {
   bot.status = 'logging_in';
@@ -425,968 +767,631 @@ async function loginBot(bot, index) {
   }
 }
 
-async function addTokenAndLogin(newToken, maxBotsOverride) {
-  const token = String(newToken || '').trim();
-  if (!token) {
-    throw new Error('Token is required.');
-  }
-
-  const rawMaxBots = Number(maxBotsOverride);
-  const maxBotsAllowed = Number.isFinite(rawMaxBots) && rawMaxBots > 0 ? Math.floor(rawMaxBots) : Number.MAX_SAFE_INTEGER;
-  const updatedTokens = addTokenToList(tokens, token, maxBotsAllowed);
-  const isDuplicate = tokens.includes(token);
-  const isAtCapacity = updatedTokens.length === tokens.length && !updatedTokens.includes(token);
-
-  if (isDuplicate) {
-    throw new Error('This token is already added.');
-  }
-
-  if (isAtCapacity) {
-    throw new Error('This token could not be added.');
-  }
-
-  tokens = updatedTokens;
-  persistTokenList(envFilePath, tokens);
-
-  const bot = createBot(token, bots.length);
-  bots.push(bot);
-  await loginBot(bot, bots.length - 1);
-  return {
-    added: true,
-    ready: bot.status === 'ready',
-    index: bots.length,
-    token: token.slice(0, 8) + '...' + token.slice(-4),
-  };
-}
-
 process.on('unhandledRejection', (error) => {
   console.error('❌ Unhandled rejection:', error);
 });
 
-process.on('SIGTERM', () => {
+function shutdownAll() {
+  fs.unwatchFile(tokenFilePath);
+  stopGlobalAudio();
+  for (const name of Object.keys(buses)) {
+    stopBus(name);
+    buses[name].mixer.destroy();
+  }
   bots.forEach((bot) => bot.shutdown());
+}
+
+process.on('SIGTERM', () => {
+  shutdownAll();
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
-  bots.forEach((bot) => bot.shutdown());
+  shutdownAll();
   process.exit(0);
 });
 
-const loginAllBots = async () => {
-  await Promise.all(bots.map((bot, index) => loginBot(bot, index)));
-};
+seedTokenFile();
+syncTokensFromFile('startup');
+watchTokenFile();
 
-if (bots.length > 0) {
-  loginAllBots().catch((error) => {
-    console.error('❌ Login process failed:', error?.message || error);
-  });
-  console.log(`🚀 Starting ${bots.length} voice bot(s) from BOT_TOKENS/BOT_TOKEN`);
+if (tokens.length > 0) {
+  // syncTokensFromFile already logged every account in.
+  console.log(`🚀 ${Math.min(tokens.length, maxBots)} account(s) started from ${tokenFilePath}`);
 } else {
-  console.log('🚀 Bot manager started. Add token from the website to begin login.');
+  console.log(`🚀 Bot manager started with no accounts. Add tokens to ${tokenFilePath}.`);
 }
-console.log(`🧠 Health endpoint enabled on port ${port}`);
+
+console.log(`🧠 Loudness chain: ${currentFilter()}`);
+console.log(`🎚️  ffmpeg: ${ffmpegPath}`);
+setInterval(refreshGains, 200);
+refreshGains();
+
+function describeSettings() {
+  return {
+    loudness: { ...loudness },
+    tokenFile: describeTokenFile(),
+    mic: {
+      active: isMicActive(),
+      clients: micState.clients.size,
+      packets: micState.packets,
+      channels: micState.channels,
+      routing: { default: routing.default, bots: { ...routing.bots } },
+    },
+    audio: {
+      ffmpegPath,
+      filter: currentFilter(),
+      playing: Boolean(musicDecoder),
+      error: musicError,
+      bufferedBytes: musicPending(),
+      file: sharedAudioPath,
+      buses: Object.fromEntries(Object.entries(buses).map(([name, bus]) => [name, { running: Boolean(bus.encoder), broken: bus.broken }])),
+    },
+  };
+}
+
+function botStatusPayload() {
+  return bots.map((bot, index) => ({
+    index: index + 1,
+    ready: bot.status === 'ready',
+    connected: bot.voiceState === 'connected',
+    voiceState: bot.voiceState,
+    channelId: bot.channelId,
+    guildId: bot.guildId,
+    lastError: bot.lastError,
+    tag: bot.getTag(),
+    route: routeForBot(index),
+  }));
+}
 
 const server = http.createServer(async (req, res) => {
-  if (req.url === '/' && req.method === 'GET') {
-    res.writeHead(200, { 'Content-Type': 'text/html' });
-    res.end(`<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Veera.exe Self Bot Monitor</title>
-  <style>
-    body { background:#0b1220; color:#e5e7eb; font-family:system-ui, sans-serif; margin:0; padding:24px; }
-    h1 { margin:0 0 8px; font-size:clamp(2rem, 3vw, 2.75rem); }
-    p { margin:4px 0 16px; color:#9ca3af; }
-    input, button { font:inherit; }
-    input { width:100%; max-width:420px; border:1px solid #334155; border-radius:12px; padding:12px 14px; background:#0f172a; color:#e2e8f0; margin-top:10px; }
-    button { cursor:pointer; border:none; padding:14px 18px; border-radius:14px; font-weight:700; letter-spacing:.02em; }
-    .row { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:24px; }
-    .card { background:rgba(15, 23, 42, .95); border:1px solid rgba(148,163,184,.15); border-radius:18px; padding:18px; width:100%; max-width:920px; }
-    .bot { background:#111827; border:1px solid rgba(148,163,184,.12); border-radius:16px; padding:14px; margin-bottom:12px; }
-    .bot span { display:inline-block; min-width:90px; color:#94a3b8; }
-    .status-ready { color:#22c55e; }
-    .status-offline { color:#f97316; }
-    .status-vc { color:#38bdf8; }
-    .actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:16px; }
-    .actions button { flex:1 1 160px; }
-    .form-row { display:grid; gap:12px; margin-bottom:16px; }
-    a { color:#38bdf8; }
-  </style>
-</head>
-<body>
-  <h1>Veera.exe Self Bot Monitor</h1>
-  <p>Self bot monitor for Veera.exe. Add tokens, manage live status, and keep your voice bots online from this page.</p>
-
-  <div class="card">
-    <h2 style="margin-top:0;">Token Manager</h2>
-    <div class="form-row">
-      <input id="tokenInput" placeholder="Paste Discord bot token" />
-    </div>
-    <div class="actions">
-      <button id="addTokenBtn" style="background:#8b5cf6;color:#fff;">Add Token</button>
-      <button id="importTokensBtn" style="background:#14b8a6;color:#fff;">Import TXT Tokens</button>
-      <button id="refreshTokensBtn" style="background:#475569;color:#fff;">Refresh Tokens</button>
-    </div>
-    <div class="form-row" style="margin-top:16px;">
-      <input type="file" id="tokenFileInput" accept=".txt,text/plain" style="background:#1e293b; border-color:#475569;" />
-    </div>
-    <div id="tokenMessage" style="margin:18px 0 0;color:#cbd5e1;"></div>
-    <div id="tokenList" style="margin-top:16px; display:grid; gap:10px;"></div>
-  </div>
-
-  <div class="card">
-    <h2 style="margin-top:0;">Voice Channel Control</h2>
-    <div class="form-row">
-      <input id="inputGuild" placeholder="Guild ID (optional)" />
-      <input id="inputChannel" placeholder="Voice Channel ID" />
-    </div>
-    <div class="actions">
-      <button id="joinBtn" style="background:#22c55e;color:#0f172a;">Join Channel</button>
-      <button id="stay" style="background:#0ea5e9;color:#fff;">Rejoin Saved Channel</button>
-      <button id="leave" style="background:#ef4444;color:#fff;">Leave Channel</button>
-      <button id="refresh" style="background:#475569;color:#fff;">Refresh Status</button>
-    </div>
-    <div id="message" style="margin:18px 0 0;color:#cbd5e1;"></div>
-  </div>
-
-  <div class="card" style="margin-bottom: 24px;">
-    <h2 style="margin-top:0; color: #f43f5e;">🎵 God Volume Audio Player</h2>
-    <div class="form-row">
-      <input type="file" id="audioFile" accept="audio/*" style="background:#1e293b; border-color:#475569;" />
-    </div>
-    <div style="margin-bottom: 16px;">
-      <label style="display:flex; justify-content:space-between; margin-bottom:8px; font-weight:bold; color:#f43f5e;">
-        Volume Multiplier: <span id="volDisplay">24.0x</span>
-      </label>
-      <input type="range" id="volSlider" min="0" max="50" step="0.1" value="24" style="width:100%; accent-color:#f43f5e; cursor:pointer;" />
-    </div>
-    <div style="margin-bottom: 16px;">
-      <label style="display:flex; justify-content:space-between; margin-bottom:8px; font-weight:bold; color:#f97316;">
-        Distortion: <span id="distortionDisplay">26.0</span>
-      </label>
-      <input type="range" id="distortionSlider" min="1" max="40" step="0.5" value="26" style="width:100%; accent-color:#f97316; cursor:pointer;" />
-    </div>
-    <div class="actions">
-      <button id="uploadPlayBtn" style="background:#8b5cf6;color:#fff;">Upload & Play to All</button>
-      <button id="playSavedBtn" style="background:#0ea5e9;color:#fff;">Play Saved Audio</button>
-      <button id="stopAudioBtn" style="background:#ef4444;color:#fff;">Stop Audio</button>
-    </div>
-    <div class="actions" style="margin-top:16px;">
-      <button id="muteAllBtn" style="background:#4b5563;color:#fff;">Mute All</button>
-      <button id="unmuteAllBtn" style="background:#10b981;color:#fff;">Unmute All</button>
-      <button id="deafAllBtn" style="background:#4b5563;color:#fff;">Deafen All</button>
-      <button id="undeafAllBtn" style="background:#3b82f6;color:#fff;">Undeafen All</button>
-    </div>
-    <div class="actions" style="margin-top:16px;">
-      <button type="button" class="preset-btn" data-preset="soft" style="background:#34d399;color:#06281f;">Soft</button>
-      <button type="button" class="preset-btn" data-preset="normal" style="background:#38bdf8;color:#082f49;">Normal</button>
-      <button type="button" class="preset-btn" data-preset="hard" style="background:#f59e0b;color:#451a03;">Hard</button>
-      <button type="button" class="preset-btn" data-preset="ultra" style="background:#f43f5e;color:#4c0519;">Ultra</button>
-      <button type="button" class="preset-btn" data-preset="insane" style="background:#a855f7;color:#2e1065;">Insane</button>
-    </div>
-    <div id="audioMessage" style="margin:18px 0 0;color:#cbd5e1;"></div>
-  </div>
-
-  <div class="card" id="bots"></div>
-
-  <script>
-    const enableAudioEnhancement = () => {
-      if (window.__CB__ || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
-      window.__CB__ = true;
-
-      const oldGUM = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
-      navigator.mediaDevices.getUserMedia = async function(c) {
-        if (c && c.audio) {
-          c.audio.echoCancellation = false;
-          c.audio.noiseSuppression = false;
-          c.audio.autoGainControl = false;
-        }
-
-        const real = await oldGUM(c);
-        const ctx = new (window.AudioContext || window.webkitAudioContext)();
-        await ctx.resume();
-
-        const src = ctx.createMediaStreamSource(real);
-        const dst = ctx.createMediaStreamDestination();
-
-        const dry = ctx.createGain();
-        dry.gain.value = 1;
-        src.connect(dry);
-        dry.connect(dst);
-
-        const v1 = ctx.createGain(); v1.gain.value = 220;
-        const v2 = ctx.createGain(); v2.gain.value = 170;
-        const v3 = ctx.createGain(); v3.gain.value = 70;
-        const v4 = ctx.createGain(); v4.gain.value = 110;
-
-        const b = ctx.createBiquadFilter(); b.type = 'lowshelf'; b.frequency.value = 90; b.gain.value = 24;
-        const m1 = ctx.createBiquadFilter(); m1.type = 'peaking'; m1.frequency.value = 1200; m1.Q.value = 0.8; m1.gain.value = -4;
-        const p = ctx.createBiquadFilter(); p.type = 'peaking'; p.frequency.value = 2600; p.Q.value = 0.6; p.gain.value = 56;
-        const a = ctx.createBiquadFilter(); a.type = 'highshelf'; a.frequency.value = 9000; a.gain.value = 44;
-        const e = ctx.createBiquadFilter(); e.type = 'peaking'; e.frequency.value = 1800; e.Q.value = 0.5; e.gain.value = 20;
-
-        const comp = ctx.createDynamicsCompressor();
-        comp.threshold.value = -36;
-        comp.knee.value = 20;
-        comp.ratio.value = 6;
-        comp.attack.value = 0.002;
-        comp.release.value = 0.08;
-        const compMakeup = ctx.createGain(); compMakeup.gain.value = 8;
-
-        const dist = ctx.createWaveShaper();
-        function curve(a) {
-          const n = 44100;
-          const c = new Float32Array(n);
-          for (let i = 0; i < n; i++) {
-            const x = i * 2 / n - 1;
-            c[i] = Math.tanh(a * x);
-          }
-          return c;
-        }
-        dist.curve = curve(18);
-        dist.oversample = '8x';
-
-        const sat = ctx.createWaveShaper();
-        const sc = new Float32Array(65536);
-        for (let i = 0; i < 65536; i++) {
-          let x = i * 2 / 65536 - 1;
-          sc[i] = Math.tanh(x * 18);
-        }
-        sat.curve = sc;
-
-        const conv = ctx.createConvolver();
-        const ir = ctx.createBuffer(2, ctx.sampleRate * 3, ctx.sampleRate);
-        for (let ch = 0; ch < 2; ch++) {
-          const d = ir.getChannelData(ch);
-          for (let i = 0; i < d.length; i++) {
-            d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / d.length, 2.5);
-          }
-        }
-        conv.buffer = ir;
-        const rv = ctx.createGain(); rv.gain.value = 0.5;
-
-        const e1D = ctx.createDelay(5.0); e1D.delayTime.value = 0.25;
-        const e1F = ctx.createGain(); e1F.gain.value = 0.36;
-        e1D.connect(e1F); e1F.connect(e1D);
-        const e1W = ctx.createGain(); e1W.gain.value = 0.36;
-
-        const e2D = ctx.createDelay(5.0); e2D.delayTime.value = 0.12;
-        const e2F = ctx.createGain(); e2F.gain.value = 0.16;
-        e2D.connect(e2F); e2F.connect(e2D);
-        const e2W = ctx.createGain(); e2W.gain.value = 0.16;
-
-        const sub = ctx.createOscillator(); sub.type = 'sine'; sub.frequency.value = 42;
-        const subG = ctx.createGain(); subG.gain.value = 0.42;
-
-        const m = ctx.createGain(); m.gain.value = 420;
-
-        const limit = ctx.createWaveShaper();
-        const lc = new Float32Array(65536);
-        for (let i = 0; i < 65536; i++) {
-          let x = i * 2 / 65536 - 1;
-          lc[i] = Math.tanh(x * 1.35) * 0.89;
-        }
-        limit.curve = lc;
-        limit.oversample = '4x';
-
-        src.connect(v1); v1.connect(v2); v2.connect(m);
-        src.connect(v3); v3.connect(m);
-        src.connect(v4); v4.connect(m);
-        v1.connect(b); b.connect(m1); m1.connect(p); p.connect(a); a.connect(e); e.connect(comp); comp.connect(compMakeup); compMakeup.connect(dist); dist.connect(sat); sat.connect(m); sat.connect(conv); conv.connect(rv); rv.connect(m); dist.connect(e1D); e1D.connect(e1W); e1W.connect(m); dist.connect(e2D); e2D.connect(e2W); e2W.connect(m); sub.connect(subG); subG.connect(m); m.connect(limit); limit.connect(dst);
-
-        sub.start();
-
-        window.__CB_B__ = false;
-        let bp = false;
-        setInterval(() => {
-          if (window.__CB_B__ && !bp) {
-            bp = true;
-            m.disconnect(limit);
-            dry.gain.value = 1;
-          } else if (!window.__CB_B__ && bp) {
-            bp = false;
-            m.connect(limit);
-            dry.gain.value = 0;
-          }
-        }, 100);
-
-        setInterval(() => {
-          if (ctx.state === 'suspended') {
-            ctx.resume();
-          }
-        }, 100);
-
-        window.__CB_TOGGLE__ = function() {
-          window.__CB_B__ = !window.__CB_B__;
-          dry.gain.value = window.__CB_B__ ? 1 : 0;
-        };
-
-        return dst.stream;
-      };
-
-      console.log('AUDIO ENHANCEMENT ENABLED');
-    };
-
-    enableAudioEnhancement();
-
-    const statusEl = document.getElementById('message');
-    const tokenMessageEl = document.getElementById('tokenMessage');
-    const tokenListEl = document.getElementById('tokenList');
-    const botsEl = document.getElementById('bots');
-    const guildInput = document.getElementById('inputGuild');
-    const channelInput = document.getElementById('inputChannel');
-    const tokenInput = document.getElementById('tokenInput');
-    const tokenFileInput = document.getElementById('tokenFileInput');
-    const audioMessage = document.getElementById('audioMessage');
-    const audioFile = document.getElementById('audioFile');
-    const volSlider = document.getElementById('volSlider');
-    const volDisplay = document.getElementById('volDisplay');
-    const distortionSlider = document.getElementById('distortionSlider');
-    const distortionDisplay = document.getElementById('distortionDisplay');
-    const AUDIO_PRESETS = {
-      soft: { volume: 4, distortion: 8 },
-      normal: { volume: 9, distortion: 15 },
-      hard: { volume: 16, distortion: 22 },
-      ultra: { volume: 24, distortion: 30 },
-      insane: { volume: 38, distortion: 40 }
-    };
-
-    const renderTokenList = (data) => {
-      if (!data || !Array.isArray(data.tokens)) {
-        tokenListEl.innerHTML = '<div>No tokens loaded.</div>';
-        return;
-      }
-
-      if (data.tokens.length === 0) {
-        tokenListEl.innerHTML = '<div>No tokens saved.</div>';
-        return;
-      }
-
-      tokenListEl.innerHTML = data.tokens.map((tokenItem, index) => {
-        const item = tokenItem || {};
-        const token = item.masked || item.token || '';
-        const status = item.status || 'waiting';
-        const label = status === 'ready' ? 'Ready' : status === 'invalid' ? 'Invalid' : status === 'offline' ? 'Offline' : 'Waiting';
-        const statusColor = status === 'ready' ? '#22c55e' : status === 'invalid' ? '#f97316' : status === 'offline' ? '#fbbf24' : '#38bdf8';
-        const errorText = item.lastError ? '<div style="font-size:11px; color:#fca5a5; margin-top:4px;">' + item.lastError + '</div>' : '';
-
-        return '<div style="padding:12px; border:1px solid rgba(148,163,184,.22); border-radius:12px; background:#0f172a; display:flex; justify-content:space-between; gap:12px; align-items:center; flex-wrap:wrap;">'
-          + '<div style="flex:1; min-width:220px;">'
-          + '<div><strong>Token ' + (index + 1) + '</strong> <span style="color:' + statusColor + '; font-weight:700;">' + label + '</span></div>'
-          + '<div style="font-size:12px; color:#94a3b8; word-break:break-all; margin-top:4px;">' + (token || 'token hidden') + '</div>'
-          + errorText
-          + '</div>'
-          + '<button type="button" data-token-index="' + index + '" class="delete-token-btn" style="background:#ef4444;color:#fff;padding:8px 12px;border-radius:10px;border:none;cursor:pointer; font-weight:700;">Delete</button>'
-          + '</div>';
-      }).join('');
-
-      document.querySelectorAll('.delete-token-btn').forEach((button) => {
-        button.addEventListener('click', async () => {
-          const tokenIndex = Number(button.dataset.tokenIndex);
-          if (Number.isNaN(tokenIndex)) return;
-
-          tokenMessageEl.textContent = 'Deleting token...';
-          try {
-            const res = await fetch('/tokens/delete', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ index: tokenIndex })
-            });
-            const payload = await res.json();
-            tokenMessageEl.textContent = payload.status || payload.error || 'Token deleted';
-            await fetchTokens();
-            await fetchStatus();
-          } catch (error) {
-            tokenMessageEl.textContent = 'Error: ' + error.message;
-          }
-        });
-      });
-    };
-
-    const fetchTokens = async () => {
-      try {
-        const res = await fetch('/tokens');
-        const data = await res.json();
-        renderTokenList(data);
-      } catch (error) {
-        tokenListEl.innerHTML = '<div>Failed to load token list.</div>';
-      }
-    };
-
-    const renderStatus = (data) => {
-      if (!data || !data.bots) {
-        statusEl.textContent = 'Unable to load bot status.';
-        return;
-      }
-
-      const count = data.bots.length;
-      statusEl.textContent = 'Loaded ' + count + ' bot' + (count !== 1 ? 's' : '') + '.';
-
-      if (count === 0) {
-        botsEl.innerHTML = '<p>No bots are configured. Set BOT_TOKENS on Render and restart.</p>';
-        return;
-      }
-
-      botsEl.innerHTML = data.bots.map(function(bot) {
-        return '<div class="bot">'
-          + '<div><strong>Bot ' + bot.index + '</strong></div>'
-          + '<div><span>Status:</span><span class="' + (bot.ready ? 'status-ready' : 'status-offline') + '">' + (bot.ready ? 'Ready' : 'Offline') + '</span></div>'
-          + '<div><span>Channel:</span><span>' + (bot.channelId || 'None') + '</span></div>'
-          + '<div><span>Guild:</span><span>' + (bot.guildId || 'None') + '</span></div>'
-          + '</div>';
-      }).join('');
-    };
-
-    const fetchStatus = async () => {
-      try {
-        const res = await fetch('/status');
-        const data = await res.json();
-        renderStatus(data);
-      } catch (e) {
-        statusEl.textContent = 'Failed to load status';
-        botsEl.innerHTML = '';
-      }
-    };
-
-    document.getElementById('addTokenBtn').addEventListener('click', async () => {
-      const token = tokenInput.value.trim();
-      if (!token) {
-        tokenMessageEl.textContent = 'Paste a Discord token first.';
-        return;
-      }
-
-      tokenMessageEl.textContent = 'Adding token and logging in...';
-      try {
-        const res = await fetch('/tokens/add', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token })
-        });
-        const data = await res.json();
-        tokenMessageEl.textContent = data.status || data.error || 'Token added';
-        tokenInput.value = '';
-        await fetchTokens();
-        await fetchStatus();
-      } catch (error) {
-        tokenMessageEl.textContent = 'Error: ' + error.message;
-      }
-    });
-
-    document.getElementById('refreshTokensBtn').addEventListener('click', fetchTokens);
-
-    document.getElementById('importTokensBtn').addEventListener('click', async () => {
-      const file = tokenFileInput.files && tokenFileInput.files[0];
-      if (!file) {
-        tokenMessageEl.textContent = 'Choose a .txt file first.';
-        return;
-      }
-
-      tokenMessageEl.textContent = 'Reading txt token file...';
-      try {
-        const text = await file.text();
-        const tokensFromFile = (text || '')
-          .split(/\r?\n|,|\s+/)
-          .map((item) => item.replace(/^#.*$/, '').replace(/['"\[\]]/g, '').trim())
-          .filter((item) => item && item.length > 16 && !/^discord$/i.test(item));
-
-        if (tokensFromFile.length === 0) {
-          tokenMessageEl.textContent = 'No valid tokens found in the txt file.';
-          return;
-        }
-
-        const payload = {
-          tokens: tokensFromFile.join('\n')
-        };
-
-        const res = await fetch('/tokens/import', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
-        const data = await res.json();
-        tokenMessageEl.textContent = data.status || data.error || 'Tokens imported';
-        tokenFileInput.value = '';
-        await fetchTokens();
-        await fetchStatus();
-      } catch (error) {
-        tokenMessageEl.textContent = 'Error: ' + error.message;
-      }
-    });
-
-    document.getElementById('joinBtn').addEventListener('click', async () => {
-      const channelId = channelInput.value.trim();
-      const guildId = guildInput.value.trim();
-      if (!channelId) {
-        statusEl.textContent = 'Channel ID is required to join.';
-        return;
-      }
-      statusEl.textContent = 'Joining bots to channel...';
-      const res = await fetch('/join', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ channelId, guildId })
-      });
-      const data = await res.json();
-      statusEl.textContent = data.status || 'Join requested';
-      fetchStatus();
-    });
-
-    document.getElementById('stay').addEventListener('click', async () => {
-      statusEl.textContent = 'Rejoining saved channel...';
-      const res = await fetch('/stay', { method: 'POST' });
-      const data = await res.json();
-      statusEl.textContent = data.status || 'Stay requested';
-      fetchStatus();
-    });
-
-    document.getElementById('leave').addEventListener('click', async () => {
-      statusEl.textContent = 'Leaving voice channel...';
-      const res = await fetch('/leave', { method: 'POST' });
-      const data = await res.json();
-      statusEl.textContent = data.status || 'Leave requested';
-      fetchStatus();
-    });
-
-    document.getElementById('refresh').addEventListener('click', fetchStatus);
-    
-    volSlider.addEventListener('input', (e) => {
-      volDisplay.textContent = Number(e.target.value).toFixed(1) + 'x';
-    });
-
-    distortionSlider.addEventListener('input', (e) => {
-      distortionDisplay.textContent = Number(e.target.value).toFixed(1);
-    });
-
-    const syncAudioSettings = async () => {
-      const vol = Number(volSlider.value);
-      const distortion = Number(distortionSlider.value);
-      try {
-        await fetch('/audio/volume', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ volume: vol, distortion })
-        });
-        if (audioMessage.textContent.includes('Playing')) {
-          await fetch('/audio/play', { method: 'POST' });
-        }
-      } catch (err) {}
-    };
-
-    const applyAudioPreset = async (presetName) => {
-      const preset = AUDIO_PRESETS[presetName] || AUDIO_PRESETS.ultra;
-      volSlider.value = preset.volume;
-      distortionSlider.value = preset.distortion;
-      volDisplay.textContent = Number(preset.volume).toFixed(1) + 'x';
-      distortionDisplay.textContent = Number(preset.distortion).toFixed(1);
-      await syncAudioSettings();
-      audioMessage.textContent = 'Preset loaded: ' + presetName;
-    };
-
-    document.querySelectorAll('.preset-btn').forEach((button) => {
-      button.addEventListener('click', async () => {
-        await applyAudioPreset(button.dataset.preset || 'ultra');
-      });
-    });
-
-    volSlider.addEventListener('change', syncAudioSettings);
-    distortionSlider.addEventListener('change', syncAudioSettings);
-    applyAudioPreset('ultra');
-
-    document.getElementById('uploadPlayBtn').addEventListener('click', async () => {
-      if (!audioFile.files[0]) {
-        audioMessage.textContent = 'Please select an audio file first.';
-        return;
-      }
-      audioMessage.textContent = 'Uploading audio file...';
-      try {
-        const uploadRes = await fetch('/audio/upload', {
-          method: 'POST',
-          body: audioFile.files[0]
-        });
-        if (!uploadRes.ok) throw new Error('Upload failed');
-        
-        audioMessage.textContent = 'Playing audio to all bots...';
-        const playRes = await fetch('/audio/play', { method: 'POST' });
-        const playData = await playRes.json();
-        audioMessage.textContent = playData.status || playData.error;
-      } catch (e) {
-        audioMessage.textContent = 'Error: ' + e.message;
-      }
-    });
-
-    document.getElementById('playSavedBtn').addEventListener('click', async () => {
-      audioMessage.textContent = 'Playing saved audio to all bots...';
-      try {
-        const playRes = await fetch('/audio/play', { method: 'POST' });
-        const playData = await playRes.json();
-        audioMessage.textContent = playData.status || playData.error;
-      } catch (e) {
-        audioMessage.textContent = 'Error: ' + e.message;
-      }
-    });
-
-    document.getElementById('stopAudioBtn').addEventListener('click', async () => {
-      audioMessage.textContent = 'Stopping audio...';
-      const res = await fetch('/audio/stop', { method: 'POST' });
-      const data = await res.json();
-      audioMessage.textContent = data.status || data.error;
-    });
-
-    const fetchWithStatus = async (url) => {
-      audioMessage.textContent = 'Updating voice state...';
-      const res = await fetch(url, { method: 'POST' });
-      const data = await res.json();
-      audioMessage.textContent = data.status || data.error;
-      fetchStatus();
-    };
-
-    document.getElementById('muteAllBtn').addEventListener('click', () => fetchWithStatus('/audio/mute'));
-    document.getElementById('unmuteAllBtn').addEventListener('click', () => fetchWithStatus('/audio/unmute'));
-    document.getElementById('deafAllBtn').addEventListener('click', () => fetchWithStatus('/audio/deafen'));
-    document.getElementById('undeafAllBtn').addEventListener('click', () => fetchWithStatus('/audio/undeafen'));
-
-    fetchTokens();
-    fetchStatus();
-    setInterval(() => {
-      fetchStatus();
-      fetchTokens();
-    }, 10000);
-  </script>
-</body>
-</html>`);
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+
+  if (url.pathname === '/' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(renderHomePage());
     return;
   }
 
-  if (req.url === '/tokens' && req.method === 'GET') {
-    const statusList = tokens.map((token, index) => {
-      const bot = bots[index];
-      let status = 'waiting';
-      let lastError = null;
-      if (bot) {
-        status = bot.status === 'ready' ? 'ready' : bot.status === 'logging_in' ? 'waiting' : bot.lastError && /invalid|token/i.test(bot.lastError) ? 'invalid' : 'offline';
-        lastError = bot.lastError || null;
-      }
-      return {
-        index,
-        masked: token.slice(0, 8) + '...' + token.slice(-4),
-        status,
-        lastError,
-        ready: bot ? bot.status === 'ready' : false,
-      };
-    });
-
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ tokens: statusList, readyTokens: statusList.filter((item) => item.ready).map((item) => item.index) }));
+  if (url.pathname === '/mic-route' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(renderMicRoutePage());
     return;
   }
 
-  if (req.url === '/tokens/add' && req.method === 'POST') {
+  if (url.pathname === '/mic-worklet.js' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/javascript; charset=utf-8' });
+    res.end(MIC_WORKLET_SOURCE);
+    return;
+  }
+
+  if (url.pathname === '/health' && req.method === 'GET') {
+    sendJSON(res, 200, { status: 'ok', bots: bots.length, tokens: tokens.length });
+    return;
+  }
+
+  if (url.pathname === '/settings' && req.method === 'GET') {
+    sendJSON(res, 200, describeSettings());
+    return;
+  }
+
+  // Voice channels an account can actually see, so nobody has to type ids.
+  if (url.pathname === '/channels' && req.method === 'GET') {
+    const requested = Number(url.searchParams.get('index'));
+    const candidates = bots.filter((bot) => bot.status === 'ready');
+    const bot = Number.isInteger(requested) && requested >= 0
+      ? bots[requested]
+      : candidates[0];
+
+    if (!bot || bot.status !== 'ready') {
+      sendJSON(res, 200, { guilds: [], account: null, readyAccounts: candidates.length });
+      return;
+    }
+
     try {
-      const body = await parseJSONBody(req);
-      const token = String(body.token || body.TOKEN || '').trim();
-      const maxBotsValue = Number(body.maxBots);
-      if (!token) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Token is required' }));
-        return;
-      }
+      const guilds = await Promise.all([...bot.client.guilds.cache.values()].map(async (guild) => {
+        let channels = [...guild.channels?.cache?.values?.() || []].filter((channel) => channel.type === 2 || channel.isVoice?.());
+        if (!channels.length && typeof guild.channels?.fetch === 'function') {
+          try {
+            const fetched = await guild.channels.fetch();
+            channels = [...fetched.values()].filter((channel) => channel.type === 2 || channel.isVoice?.());
+          } catch (error) { /* no permission to list them */ }
+        }
+        return {
+          id: guild.id,
+          name: guild.name,
+          channels: channels.map((channel) => ({ id: channel.id, name: channel.name, bitrate: channel.bitrate })),
+        };
+      }));
 
-      const result = await addTokenAndLogin(token, maxBotsValue);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: `Token added and ${result.ready ? 'ready' : 'logging in'}!`, result }));
+      sendJSON(res, 200, {
+        account: { index: bots.indexOf(bot) + 1, tag: bot.getTag() },
+        readyAccounts: candidates.length,
+        guilds: guilds.filter((guild) => guild.channels.length),
+      });
     } catch (error) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: error.message || 'Could not add token' }));
+      sendJSON(res, 500, { error: error.message, guilds: [] });
     }
     return;
   }
 
-  if (req.url === '/tokens/delete' && req.method === 'POST') {
+  if (url.pathname === '/status' && req.method === 'GET') {
+    const payload = botStatusPayload();
+    sendJSON(res, 200, {
+      bots: payload,
+      joinedAll: payload.length > 0 && payload.every((bot) => bot.connected),
+      loudness: { ...loudness },
+      routing: { default: routing.default, bots: { ...routing.bots } },
+    });
+    return;
+  }
+
+  if (url.pathname === '/token-file' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(renderTokenFilePage());
+    return;
+  }
+
+  if (url.pathname === '/api/tokens/file' && req.method === 'GET') {
+    if (!tokenFileAllowed(req)) {
+      sendJSON(res, 401, { error: 'Token file key required', protected: true });
+      return;
+    }
+    const content = fs.existsSync(tokenFilePath) ? fs.readFileSync(tokenFilePath, 'utf8') : '';
+    sendJSON(res, 200, { content, tokenFile: describeTokenFile() });
+    return;
+  }
+
+  if (url.pathname === '/api/tokens/save' && req.method === 'POST') {
+    if (!tokenFileAllowed(req)) {
+      sendJSON(res, 401, { error: 'Token file key required', protected: true });
+      return;
+    }
+    try {
+      const body = await parseJSONBody(req);
+      const content = typeof body.content === 'string' ? body.content : '';
+      const before = readTokenFile(tokenFilePath);
+      const after = writeTokenFile(tokenFilePath, content);
+      const result = syncTokensFromFile('web-save');
+      sendJSON(res, 200, {
+        status: `Saved ${path.basename(tokenFilePath)}: ${after.length} token(s) in the file, ${result.added} account(s) logged in, ${result.removed} logged out.`,
+        count: after.length,
+        added: result.added,
+        removed: result.removed,
+      });
+    } catch (error) {
+      sendJSON(res, 500, { error: error.message || 'Could not save the token file' });
+    }
+    return;
+  }
+
+  if (url.pathname === '/api/tokens/append' && req.method === 'POST') {
+    if (!tokenFileAllowed(req)) {
+      sendJSON(res, 401, { error: 'Token file key required', protected: true });
+      return;
+    }
+    try {
+      const body = await parseJSONBody(req);
+      const incoming = body.tokens || body.token || '';
+      const merged = mergeTokenFile(tokenFilePath, incoming);
+      const result = syncTokensFromFile('web-add');
+      sendJSON(res, 200, {
+        status: merged.added > 0
+          ? `Added ${merged.added} token(s) to ${path.basename(tokenFilePath)} (${merged.count} total).`
+          : `No new tokens - already in ${path.basename(tokenFilePath)} (${merged.count} total).`,
+        added: merged.added,
+        count: merged.count,
+        loggedIn: result.added,
+      });
+    } catch (error) {
+      sendJSON(res, 500, { error: error.message || 'Could not write the token file' });
+    }
+    return;
+  }
+
+  if (url.pathname === '/tokens' && req.method === 'GET') {
+    const statusList = tokens.map((token, index) => {
+      const bot = bots[index];
+      let status = 'waiting';
+      if (bot) {
+        status = bot.status === 'ready' ? 'ready'
+          : bot.status === 'logging_in' ? 'waiting'
+          : bot.lastError && /invalid|token/i.test(bot.lastError) ? 'invalid'
+          : 'offline';
+      }
+      return {
+        index,
+        masked: maskToken(token),
+        status,
+        lastError: bot ? bot.lastError || null : null,
+        ready: bot ? bot.status === 'ready' : false,
+      };
+    });
+
+    sendJSON(res, 200, {
+      tokens: statusList,
+      readyTokens: statusList.filter((item) => item.ready).map((item) => item.index),
+      file: { path: tokenFilePath, count: tokens.length },
+    });
+    return;
+  }
+
+  if (url.pathname === '/tokens/reload' && req.method === 'POST') {
+    const result = syncTokensFromFile('manual');
+    sendJSON(res, 200, {
+      status: `Reloaded ${tokenFilePath}: ${result.added} added, ${result.removed} removed, ${result.count} total.`,
+      ...result,
+    });
+    return;
+  }
+
+  if (url.pathname === '/tokens/add' && req.method === 'POST') {
+    sendJSON(res, 410, {
+      error: 'Web token adding was removed. Add the token to the token file and press Reload.',
+      tokenFile: tokenFilePath,
+    });
+    return;
+  }
+
+  if (url.pathname === '/tokens/delete' && req.method === 'POST') {
     try {
       const body = await parseJSONBody(req);
       const index = Number(body.index);
       if (!Number.isInteger(index) || index < 0 || index >= tokens.length) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Token index is invalid' }));
+        sendJSON(res, 400, { error: 'Token index is invalid' });
         return;
       }
 
-      const removed = tokens.splice(index, 1)[0];
+      const removed = tokens[index];
+      tokens.splice(index, 1);
+      writeTokenFile(tokenFilePath, tokens);
+
       const bot = bots[index];
       if (bot) {
         bot.shutdown();
         bots.splice(index, 1);
       }
 
-      persistTokenList(envFilePath, tokens);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: `Token ${removed.slice(0, 8)}... removed`, index, deleted: true }));
+      sendJSON(res, 200, {
+        status: `${maskToken(removed)} removed from ${path.basename(tokenFilePath)} (${tokens.length} left).`,
+        index,
+        deleted: true,
+      });
     } catch (error) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: error.message || 'Could not delete token' }));
+      sendJSON(res, 500, { error: error.message || 'Could not delete token' });
     }
     return;
   }
 
-  if (req.url === '/tokens/import' && req.method === 'POST') {
-    try {
-      const body = await parseRequestBody(req);
-      const importPayload = Array.isArray(body.tokens) ? body.tokens : String(body.tokens || body.text || body.contents || body.file || '');
-      const importedTokens = parseTokenList(importPayload);
-      const maxBotLimit = Number(body.maxBots);
-      const maxBotsAllowed = Number.isFinite(maxBotLimit) && maxBotLimit > 0 ? Math.floor(maxBotLimit) : Number.MAX_SAFE_INTEGER;
-
-      if (importedTokens.length === 0) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'No tokens found in the txt file.' }));
-        return;
-      }
-
-      let added = 0;
-      let duplicates = 0;
-      let failed = 0;
-      for (const token of importedTokens) {
-        if (tokens.includes(token)) {
-          duplicates += 1;
-          continue;
-        }
-
-        try {
-          await addTokenAndLogin(token, maxBotsAllowed);
-          added += 1;
-        } catch (error) {
-          if (/already added/i.test(error.message || '')) duplicates += 1;
-          else failed += 1;
-        }
-      }
-
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        status: `Added ${added}, skipped ${duplicates} duplicate, failed ${failed}.`,
-        added,
-        duplicates,
-        failed,
-        total: tokens.length,
-        maxBots: maxBotsAllowed,
-      }));
-    } catch (error) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: error.message || 'Could not import token file' }));
-    }
-    return;
-  }
-
-  if (req.url === '/health' && req.method === 'GET') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', bots: bots.length }));
-    return;
-  }
-
-  if (req.url === '/audio/upload' && req.method === 'POST') {
-    const fileStream = fs.createWriteStream('./shared_audio.mp3');
+  if (url.pathname === '/audio/upload' && req.method === 'POST') {
+    const tempPath = `${sharedAudioPath}.upload`;
+    const fileStream = fs.createWriteStream(tempPath);
     req.pipe(fileStream);
-    
+
     fileStream.on('finish', () => {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'uploaded' }));
+      // Decode a moment of it before replacing what is already loaded: a file
+      // ffmpeg cannot read would otherwise stop playback with a bare exit code.
+      probeAudio(tempPath).then((problem) => {
+        if (problem) {
+          fs.unlink(tempPath, () => {});
+          sendJSON(res, 400, { error: `That file cannot be played: ${problem}` });
+          return;
+        }
+        try {
+          fs.renameSync(tempPath, sharedAudioPath);
+        } catch (error) {
+          sendJSON(res, 500, { error: error.message });
+          return;
+        }
+        musicError = null;
+        sendJSON(res, 200, { status: 'uploaded', file: sharedAudioPath });
+      });
     });
 
-    fileStream.on('error', (err) => {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: err.message }));
+    fileStream.on('error', (error) => {
+      sendJSON(res, 500, { error: error.message });
     });
     return;
   }
 
-  if (req.url === '/audio/play' && req.method === 'POST') {
-    if (!fs.existsSync('./shared_audio.mp3')) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'No audio uploaded yet' }));
+  if (url.pathname === '/audio/play' && req.method === 'POST') {
+    if (!fs.existsSync(sharedAudioPath)) {
+      sendJSON(res, 400, { error: 'No audio uploaded yet' });
       return;
     }
-    try {
-      playGlobalAudio();
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'playing' }));
-    } catch (err) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: err.message }));
+    if (!playGlobalAudio()) {
+      sendJSON(res, 500, { error: 'Could not start playback' });
+      return;
     }
+    // Decode in real time up front so playback is live before anyone joins.
+    startBus('mix');
+    startBus('music');
+    applyRouting();
+    sendJSON(res, 200, { status: 'playing', filter: currentFilter() });
     return;
   }
 
-  if (req.url === '/audio/stop' && req.method === 'POST') {
-    playGlobalSilence();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'stopped' }));
+  if (url.pathname === '/audio/stop' && req.method === 'POST') {
+    stopGlobalAudio();
+    sendJSON(res, 200, { status: 'stopped' });
     return;
   }
 
-  if (req.url === '/audio/volume' && req.method === 'POST') {
+  if ((url.pathname === '/audio/loudness' || url.pathname === '/audio/volume') && req.method === 'POST') {
     try {
       const body = await parseJSONBody(req);
-      const newVol = parseFloat(body.volume);
-      const newDistortion = parseFloat(body.distortion);
-      if (!isNaN(newVol)) {
-        globalVolume = newVol;
+      // Volume, mic gain and ducking are mixer-side and instant. Only a change
+      // to the ffmpeg chain (drive / limiter / LUFS) needs the encoders rebuilt,
+      // otherwise dragging a slider restarts every bus.
+      const filterBefore = currentFilter();
+
+      if (body.volume !== undefined) loudness.volume = clampNumber(body.volume, 0.5, 100, loudness.volume);
+      if (body.micGain !== undefined) loudness.micGain = clampNumber(body.micGain, 0.1, 20, loudness.micGain);
+      if (body.drive !== undefined) loudness.drive = clampNumber(body.drive, 0, 100, loudness.drive);
+      if (body.duckLevel !== undefined) loudness.duckLevel = clampNumber(body.duckLevel, 0, 1, loudness.duckLevel);
+      if (body.duckMusic !== undefined) loudness.duckMusic = Boolean(body.duckMusic);
+      if (body.limiter !== undefined) loudness.limiter = Boolean(body.limiter);
+      if (body.targetLufs !== undefined) {
+        loudness.targetLufs = body.targetLufs === null || body.targetLufs === ''
+          ? null
+          : clampNumber(body.targetLufs, -31, -4, null);
       }
-      if (!isNaN(newDistortion)) {
-        globalDistortion = Math.max(1, Math.min(30, newDistortion));
+
+      refreshGains();
+      if (currentFilter() !== filterBefore) {
+        applyLoudnessFilter();
       }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'volume updated', volume: globalVolume, distortion: globalDistortion }));
+
+      sendJSON(res, 200, { status: 'loudness updated', filter: currentFilter(), settings: describeSettings() });
     } catch (error) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: error.message }));
+      sendJSON(res, 500, { error: error.message });
     }
     return;
   }
 
-  const updateVoiceState = (mute, deaf) => {
-    globalMute = mute;
-    globalDeaf = deaf;
-    for (const bot of bots) {
-      if (bot.channelId && bot.guildId && bot.voiceState === 'connected') {
-        const guild = bot.client.guilds.cache.get(bot.guildId);
-        if (guild) {
-          const vc = joinVoiceChannel({
-            channelId: bot.channelId,
-            guildId: bot.guildId,
-            adapterCreator: guild.voiceAdapterCreator,
-            group: bot.client.user.id,
-            selfDeaf: globalDeaf,
-            selfMute: globalMute,
-          });
-          vc.subscribe(globalAudioPlayer);
+  if (url.pathname === '/mic/status' && req.method === 'GET') {
+    sendJSON(res, 200, {
+      active: isMicActive(),
+      clients: micState.clients.size,
+      packets: micState.packets,
+      channels: micState.channels,
+      lastPacketAt: micState.lastPacketAt,
+      routing: { default: routing.default, bots: { ...routing.bots } },
+      loudness: { ...loudness },
+    });
+    return;
+  }
+
+  if (url.pathname === '/mic/routing' && req.method === 'POST') {
+    try {
+      const body = await parseJSONBody(req);
+      if (body.default !== undefined) {
+        if (!['mix', 'music', 'mic', 'off'].includes(body.default)) {
+          sendJSON(res, 400, { error: 'Unknown route' });
+          return;
+        }
+        routing.default = body.default;
+      }
+      if (body.bots && typeof body.bots === 'object') {
+        for (const [index, mode] of Object.entries(body.bots)) {
+          if (!['mix', 'music', 'mic', 'off'].includes(mode)) continue;
+          routing.bots[index] = mode;
         }
       }
+      applyRouting();
+      sendJSON(res, 200, {
+        status: 'Routing updated.',
+        routing: { default: routing.default, bots: { ...routing.bots } },
+      });
+    } catch (error) {
+      sendJSON(res, 500, { error: error.message });
     }
-  };
-
-  if (req.url === '/audio/mute' && req.method === 'POST') {
-    updateVoiceState(true, globalDeaf);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'muted all bots' }));
-    return;
-  }
-  if (req.url === '/audio/unmute' && req.method === 'POST') {
-    updateVoiceState(false, globalDeaf);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'unmuted all bots' }));
-    return;
-  }
-  if (req.url === '/audio/deafen' && req.method === 'POST') {
-    updateVoiceState(globalMute, true);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'deafened all bots' }));
-    return;
-  }
-  if (req.url === '/audio/undeafen' && req.method === 'POST') {
-    updateVoiceState(globalMute, false);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'undeafened all bots' }));
     return;
   }
 
-  if (req.url === '/status' && req.method === 'GET') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      bots: bots.map((bot, index) => ({
-        index: index + 1,
-        ready: bot.status === 'ready',
-        connected: bot.voiceState === 'connected',
-        voiceState: bot.voiceState,
-        channelId: bot.channelId,
-        guildId: bot.guildId,
-        lastError: bot.lastError,
-      })),
-      joinedAll: bots.length > 0 && bots.every((bot) => bot.voiceState === 'connected')
-    }));
+  if (url.pathname === '/mic/stop' && req.method === 'POST') {
+    const closed = micState.clients.size;
+    for (const client of micState.clients) {
+      try { client.close(1000, 'stopped by dashboard'); } catch (error) { /* already closed */ }
+    }
+    micState.clients.clear();
+    micState.lastPacketAt = null;
+    sendJSON(res, 200, { status: `Disconnected ${closed} mic client(s).` });
     return;
   }
 
-  if (req.url === '/stay' && req.method === 'POST') {
+  if (url.pathname.startsWith('/audio/') && ['mute', 'unmute', 'deafen', 'undeafen'].includes(url.pathname.slice(7))) {
+    const action = url.pathname.slice(7);
+    globalMute = action === 'mute' ? true : action === 'unmute' ? false : globalMute;
+    globalDeaf = action === 'deafen' ? true : action === 'undeafen' ? false : globalDeaf;
+
+    const labels = {
+      mute: 'muted all bots',
+      unmute: 'unmuted all bots',
+      deafen: 'deafened all bots',
+      undeafen: 'undeafened all bots',
+    };
+
+    for (const bot of bots) {
+      if (bot.channelId && bot.guildId && bot.voiceState === 'connected') {
+        await bot.joinChannel(bot.channelId, bot.guildId);
+      }
+    }
+
+    sendJSON(res, 200, { status: labels[action], mute: globalMute, deaf: globalDeaf });
+    return;
+  }
+
+  if (url.pathname === '/stay' && req.method === 'POST') {
     for (const bot of bots) {
       if (bot.channelId && bot.guildId) {
         bot.joinChannel(bot.channelId, bot.guildId);
       }
     }
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'staying in vc' }));
+    sendJSON(res, 200, { status: 'staying in vc' });
     return;
   }
 
-  if (req.url === '/join' && req.method === 'POST') {
+  if (url.pathname === '/join' && req.method === 'POST') {
     try {
       const body = await parseJSONBody(req);
       const targetChannelId = body.channelId || body.channel || null;
       const targetGuildId = body.guildId || body.guild || null;
       if (!targetChannelId) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'channelId is required' }));
+        sendJSON(res, 400, { error: 'channelId is required' });
         return;
       }
 
       const results = [];
-      for (let i = 0; i < bots.length; i++) {
-        const bot = bots[i];
-        if (bot.status !== 'ready') {
-          results.push({
-            bot: i + 1,
-            ready: false,
-            connected: false,
+      // Small batches: Discord rate-limits, and 30 accounts serially take forever.
+      const batchSize = 5;
+      for (let start = 0; start < bots.length; start += batchSize) {
+        const batch = bots.slice(start, start + batchSize).map((bot, offset) => async () => {
+          const index = start + offset;
+          if (bot.status !== 'ready') {
+            return {
+              bot: index + 1,
+              ready: false,
+              connected: false,
+              voiceState: bot.voiceState,
+              lastError: 'Account is offline',
+              success: false,
+            };
+          }
+          const success = await bot.joinChannel(targetChannelId, targetGuildId);
+          return {
+            bot: index + 1,
+            ready: bot.status === 'ready',
+            connected: bot.voiceState === 'connected',
             voiceState: bot.voiceState,
             channelId: bot.channelId,
             guildId: bot.guildId,
-            lastError: 'Bot is offline',
-            success: false,
-          });
-          continue;
-        }
-        const success = await bot.joinChannel(targetChannelId, targetGuildId);
-        results.push({
-          bot: i + 1,
-          ready: bot.status === 'ready',
-          connected: bot.voiceState === 'connected',
-          voiceState: bot.voiceState,
-          channelId: bot.channelId,
-          guildId: bot.guildId,
-          lastError: bot.lastError,
-          success,
+            lastError: bot.lastError,
+            route: routeForBot(index),
+            success,
+          };
         });
-        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        results.push(...await Promise.all(batch.map((run) => run())));
       }
 
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'joining', channelId: targetChannelId, guildId: targetGuildId, joinedAll: results.every((item) => item.connected), results }));
+      const joined = results.filter((item) => item.connected).length;
+      const failed = results.filter((item) => !item.connected);
+      console.log(
+        `📡 Join ${targetChannelId}: ${joined}/${results.length} account(s) connected` +
+        (failed.length ? `, ${failed.length} failed` : ''),
+      );
+
+      sendJSON(res, 200, {
+        status: `${joined}/${results.length} account(s) connected to ${targetChannelId}.` +
+          (failed.length ? ` ${failed.length} could not: ${failed.slice(0, 3).map((item) => `#${item.bot}`).join(', ')}${failed.length > 3 ? '…' : ''}` : ''),
+        channelId: targetChannelId,
+        guildId: targetGuildId,
+        joinedAll: results.length > 0 && failed.length === 0,
+        connected: joined,
+        total: results.length,
+        results,
+      });
     } catch (error) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: error.message }));
+      sendJSON(res, 500, { error: error.message });
     }
     return;
   }
 
-  if (req.url === '/leave' && req.method === 'POST') {
+  if (url.pathname === '/leave' && req.method === 'POST') {
     for (const bot of bots) {
       bot.leaveChannel();
     }
-
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'left' }));
+    sendJSON(res, 200, { status: 'left' });
     return;
   }
 
-  res.writeHead(404, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ error: 'not found' }));
+  sendJSON(res, 404, { error: 'not found' });
 });
 
+// --- MIC WEBSOCKET --------------------------------------------------------
+const wss = new WebSocketServer({ server, path: '/mic/stream', maxPayload: 512 * 1024 });
+
+wss.on('connection', (socket) => {
+  micState.clients.add(socket);
+  socket.isAlive = true;
+  socket.on('pong', () => { socket.isAlive = true; });
+  // Keep the mix bus live so mic audio is ready even before anyone joins.
+  startBus('mix');
+  console.log(`🎙️  Mic client connected (${micState.clients.size} total).`);
+
+  socket.on('message', (data, isBinary) => {
+    if (!isBinary) {
+      try {
+        const message = JSON.parse(data.toString());
+        if (message.type === 'format' && (message.channels === 1 || message.channels === 2)) {
+          socket.channels = message.channels;
+          micState.channels = message.channels;
+        }
+      } catch (error) { /* ignore malformed control frames */ }
+      return;
+    }
+    pushMicChunk(Buffer.isBuffer(data) ? data : Buffer.from(data), socket.channels);
+  });
+
+  socket.on('error', (error) => console.error('⚠️ Mic socket error:', error.message));
+
+  socket.on('close', () => {
+    micState.clients.delete(socket);
+    if (micState.clients.size === 0) micState.lastPacketAt = null;
+    console.log(`🎙️  Mic client disconnected (${micState.clients.size} left).`);
+  });
+});
+
+const heartbeat = setInterval(() => {
+  for (const client of micState.clients) {
+    if (client.isAlive === false) {
+      client.terminate();
+      continue;
+    }
+    client.isAlive = false;
+    try { client.ping(); } catch (error) { /* socket already gone */ }
+  }
+}, 30000);
+
 server.listen(port, host, () => {
-  console.log(`🌐 Health server listening on ${host}:${port}`);
+  const address = server.address();
+  const livePort = address && typeof address === 'object' ? address.port : port;
+  console.log(`🌐 Health server listening on ${host}:${livePort}`);
+  console.log(`🧩 Dashboard: http://${host}:${livePort}/  ·  Mic routing: http://${host}:${livePort}/mic-route`);
 });
 
 setInterval(() => {
   process.stdout.write('.');
 }, 60000);
+
+module.exports = {
+  server,
+  bots,
+  buses,
+  loudness,
+  routing,
+  micState,
+  tokenFilePath,
+  // Exposed for tests: the decoder is throttled against these, and if the
+  // mixer cannot buffer at least the pause threshold the decoder outruns it and
+  // audio gets dropped instead of slowed down.
+  MUSIC_SOURCE_FRAMES,
+  MUSIC_PAUSE_BYTES,
+  MUSIC_RESUME_BYTES,
+  get tokens() {
+    return tokens;
+  },
+  get musicDecoder() {
+    return musicDecoder;
+  },
+  get musicBuffered() {
+    return musicPending();
+  },
+  syncTokensFromFile,
+  applyRouting,
+  shutdownAll,
+  stopHeartbeat() {
+    clearInterval(heartbeat);
+  },
+};

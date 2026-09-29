@@ -13,5 +13,24 @@ services:
         value: 0.0.0.0
       - key: PORT
         value: 10000
+      - key: TOKENS_FILE
+        value: tokens.txt
+      - key: TOKEN_FILE_KEY
+        sync: false
       - key: MAX_BOTS
-        value: 5
+        value: 0
+      - key: AUTO_JOIN
+        value: "false"
+      - key: AUDIO_VOLUME
+        value: 12
+      - key: AUDIO_DRIVE
+        value: 40
+      - key: AUDIO_LIMITER
+        value: "true"
+      - key: AUDIO_DUCK_MUSIC
+        value: "true"
+      - key: MIC_GAIN
+        value: 6
+      - key: MIC_ROUTE_DEFAULT
+        value: mix
+

@@ -15,7 +15,8 @@
     "build:electron": "electron-builder",
     "build:web": "npm run build:renderer",
     "preview": "vite preview",
-    "start": "node kolaru.js"
+    "start": "node kolaru.js",
+    "test": "node --test --test-force-exit"
   },
   "keywords": [],
   "author": "",
@@ -34,7 +35,8 @@
     "opusscript": "^0.0.8",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
-    "tailwind-merge": "^3.6.0"
+    "tailwind-merge": "^3.6.0",
+    "ws": "^8.20.1"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^6.0.1",

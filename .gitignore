@@ -8,6 +8,10 @@ dist-test/
 .env.*
 .env.*.local
 !.env.example
+tokens.txt
+shared_audio.mp3
+shared_audio.mp3.upload
+*.bak
 out/
 build/
 .git/

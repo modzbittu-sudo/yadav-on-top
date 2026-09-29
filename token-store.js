@@ -1,54 +1,61 @@
 const fs = require('fs');
 const path = require('path');
 
-function normalizeTokenCandidate(rawItem) {
-  let item = String(rawItem ?? '').replace(/\r/g, '').trim();
-  if (!item || item.startsWith('#') || item.startsWith('//')) {
-    return '';
-  }
-
-  item = item.replace(/^#.*$/, '').trim();
-  if (!item) {
-    return '';
-  }
-
-  const stripped = item
-    .replace(/^BOT_TOKENS?\s*[:=]\s*/i, '')
-    .replace(/^TOKEN\s*[:=]\s*/i, '')
-    .replace(/^DISCORD_TOKEN\s*[:=]\s*/i, '')
-    .replace(/^\s*['\"]|['\"]\s*$/g, '')
-    .replace(/^[\[\(]+|[\]\)]+$/g, '')
-    .split(/\s+/)[0]
-    .trim();
-
-  if (!stripped || /^(?:comment|old|example|token)$/i.test(stripped)) {
-    return '';
-  }
-
-  if (!/^[A-Za-z0-9._-]+$/.test(stripped)) {
-    return '';
-  }
-
-  return stripped;
-}
+const LINE_COMMENT = /^\s*(?:#|\/\/|;)/;
 
 function parseTokenList(value) {
-  const rawValues = Array.isArray(value) ? value : [value];
+  const lines = Array.isArray(value)
+    ? value.flatMap((item) => String(item || '').split(/[\r\n]+/))
+    : String(value || '').split(/[\r\n]+/);
 
-  return rawValues
-    .flatMap((entry) => String(entry ?? '').split(/\r?\n|,|;/))
-    .map((item) => normalizeTokenCandidate(item))
+  return lines
+    .filter((line) => !LINE_COMMENT.test(line))
+    .flatMap((line) => line.split(/[,;]+/))
+    .map((item) => item.trim())
     .filter(Boolean)
     .filter((item, index, array) => array.indexOf(item) === index);
 }
 
+// Token file helpers: one token per line, blank lines and `#` comments ignored.
 function readTokenFile(filePath) {
   if (!filePath || !fs.existsSync(filePath)) {
     return [];
   }
+  return parseTokenList(fs.readFileSync(filePath, 'utf8'));
+}
 
-  const content = fs.readFileSync(filePath, 'utf8');
-  return parseTokenList(content);
+function writeTokenFile(filePath, tokens) {
+  const normalized = parseTokenList(tokens);
+
+  if (!filePath) {
+    return normalized;
+  }
+
+  const directory = path.dirname(filePath);
+  if (!fs.existsSync(directory)) {
+    fs.mkdirSync(directory, { recursive: true });
+  }
+
+  const body = normalized.join('\n');
+  fs.writeFileSync(filePath, body ? `${body}\n` : '', 'utf8');
+  return normalized;
+}
+
+function diffTokenLists(previousTokens, nextTokens) {
+  const previous = parseTokenList(previousTokens);
+  const next = parseTokenList(nextTokens);
+
+  return {
+    added: next.filter((token) => !previous.includes(token)),
+    removed: previous.filter((token) => !next.includes(token)),
+  };
+}
+
+// Adds tokens to the file without touching the ones already in it.
+function mergeTokenFile(filePath, incomingTokens) {
+  const existing = readTokenFile(filePath);
+  const merged = writeTokenFile(filePath, [...existing, ...parseTokenList(incomingTokens)]);
+  return { added: merged.length - existing.length, count: merged.length, tokens: merged };
 }
 
 function addTokenToList(existingTokens, newToken, maxBots = Number.MAX_SAFE_INTEGER) {
@@ -115,7 +122,10 @@ function persistTokenList(filePath, tokens) {
 
 module.exports = {
   parseTokenList,
-  readTokenFile,
   addTokenToList,
   persistTokenList,
+  readTokenFile,
+  writeTokenFile,
+  diffTokenLists,
+  mergeTokenFile,
 };

@@ -1,8 +1,10 @@
-const fs = require('node:fs');
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
-const { parseTokenList, addTokenToList, persistTokenList, readTokenFile } = require('../token-store');
+const { parseTokenList, addTokenToList, persistTokenList, readTokenFile, writeTokenFile, diffTokenLists } = require('../token-store');
 
 test('parseTokenList reads comma and newline separated tokens', () => {
   const tokens = parseTokenList('abc, def\nghi, jkl');
@@ -31,17 +33,39 @@ test('persistTokenList writes BOT_TOKENS using comma list', () => {
   assert.equal(output, 'token1,token2');
 });
 
-test('readTokenFile imports tokens from a .txt file', () => {
-  const filePath = 'test/tokens-import.txt';
-  fs.writeFileSync(filePath, 'token-a\n# comment\n token-b , token-c\n\n token-d\n');
-
-  const tokens = readTokenFile(filePath);
-  assert.deepEqual(tokens, ['token-a', 'token-b', 'token-c', 'token-d']);
-
-  fs.unlinkSync(filePath);
+test('parseTokenList skips comments, blanks and duplicates', () => {
+  const parsed = parseTokenList([
+    '# header comment',
+    '',
+    '  token-a  ',
+    '// another comment',
+    '; third style',
+    'token-a',
+    'token-b,token-c',
+  ]);
+  assert.deepEqual(parsed, ['token-a', 'token-b', 'token-c']);
 });
 
-test('parseTokenList accepts BOT_TOKENS lines from old env txt files', () => {
-  const tokens = parseTokenList('BOT_TOKENS=token-a, token-b\n# old\n token-c\n token-d');
-  assert.deepEqual(tokens, ['token-a', 'token-b', 'token-c', 'token-d']);
+test('readTokenFile and writeTokenFile round-trip through a text file', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tokens-'));
+  const file = path.join(dir, 'nested', 'tokens.txt');
+
+  assert.deepEqual(readTokenFile(file), [], 'missing file reads as empty');
+
+  writeTokenFile(file, ['token-1', ' token-2 ', 'token-1', '']);
+  assert.equal(fs.readFileSync(file, 'utf8'), 'token-1\ntoken-2\n');
+  assert.deepEqual(readTokenFile(file), ['token-1', 'token-2']);
+
+  fs.writeFileSync(file, '# only comments here\n\n');
+  assert.deepEqual(readTokenFile(file), []);
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('diffTokenLists reports added and removed tokens', () => {
+  assert.deepEqual(
+    diffTokenLists(['a', 'b', 'c'], ['b', 'c', 'd']),
+    { added: ['d'], removed: ['a'] },
+  );
+  assert.deepEqual(diffTokenLists(['a'], ['a']), { added: [], removed: [] });
 });
