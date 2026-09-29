@@ -20,9 +20,9 @@ services:
       - key: AUTO_JOIN
         value: "false"
       - key: AUDIO_VOLUME
-        value: 18
+        value: 24
       - key: AUDIO_DRIVE
-        value: 55
+        value: 65
       - key: AUDIO_LIMITER
         value: "true"
       - key: MIC_GAIN

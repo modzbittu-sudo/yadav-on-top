@@ -4,6 +4,13 @@ const { EventEmitter } = require('node:events');
 const { PassThrough } = require('node:stream');
 
 const { PcmMixer, buildLoudnessFilter, createEncoder, createDecoder, BLOCK_FRAMES, BYTES_PER_FRAME } = require('../audio-pipeline');
+const { AUDIO_DEFAULTS, MUSIC_BUFFER } = require('../audio-config');
+
+test('audio config keeps shared playback loud and its buffer thresholds ordered', () => {
+  assert.deepEqual(AUDIO_DEFAULTS, { volume: 24, drive: 65, limiter: true, micGain: 6 });
+  assert.ok(MUSIC_BUFFER.resumeBytes < MUSIC_BUFFER.pauseBytes);
+  assert.ok(MUSIC_BUFFER.pauseBytes < MUSIC_BUFFER.maxFrames * BYTES_PER_FRAME);
+});
 
 // Float32 LE samples: the format the mixer works in.
 function pcm(values) {

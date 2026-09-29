@@ -7,6 +7,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const ffmpeg = require('ffmpeg-static');
+const { AUDIO_DEFAULTS, MUSIC_BUFFER } = require('./audio-config');
 const { PcmMixer, buildLoudnessFilter, createEncoder, createDecoder, INT16_SAMPLE_BYTES, INT16_BYTES_PER_FRAME } = require('./audio-pipeline');
 const { readTokenFile, writeTokenFile, diffTokenLists, mergeTokenFile } = require('./token-store');
 const { renderHomePage } = require('./views/home');
@@ -89,11 +90,11 @@ const tokenFileEnv = process.env.BOT_TOKENS || process.env.BOT_TOKEN || '';
 const tokenFileKey = (process.env.TOKEN_FILE_KEY || '').trim();
 
 const loudness = {
-  volume: clampNumber(process.env.AUDIO_VOLUME, 0.5, 100, 18),
-  drive: clampNumber(process.env.AUDIO_DRIVE, 0, 100, 55),
-  limiter: (process.env.AUDIO_LIMITER || 'true').toLowerCase() !== 'false',
+  volume: clampNumber(process.env.AUDIO_VOLUME, 0.5, 100, AUDIO_DEFAULTS.volume),
+  drive: clampNumber(process.env.AUDIO_DRIVE, 0, 100, AUDIO_DEFAULTS.drive),
+  limiter: (process.env.AUDIO_LIMITER || String(AUDIO_DEFAULTS.limiter)).toLowerCase() !== 'false',
   targetLufs: process.env.AUDIO_TARGET_LUFS ? clampNumber(process.env.AUDIO_TARGET_LUFS, -31, -4, null) : null,
-  micGain: clampNumber(process.env.MIC_GAIN, 0.1, 20, 6),
+  micGain: clampNumber(process.env.MIC_GAIN, 0.1, 20, AUDIO_DEFAULTS.micGain),
 };
 
 const routing = {
@@ -192,9 +193,7 @@ function watchTokenFile() {
 // The mixers hold a few hundred ms of source so a fast decoder never has to
 // drop audio, and the decoder is throttled against that (see pushMusicChunk).
 // Two seconds of headroom per source absorbs short event-loop delays.
-const MUSIC_SOURCE_FRAMES = 96000;
-const MUSIC_PAUSE_BYTES = 230400;
-const MUSIC_RESUME_BYTES = 76800;
+const { maxFrames: MUSIC_SOURCE_FRAMES, pauseBytes: MUSIC_PAUSE_BYTES, resumeBytes: MUSIC_RESUME_BYTES } = MUSIC_BUFFER;
 const buses = {
   mix: { mixer: new PcmMixer({ maxPendingFrames: MUSIC_SOURCE_FRAMES }), player: null, encoder: null, resource: null, retryTimer: null, broken: false },
   music: { mixer: new PcmMixer({ maxPendingFrames: MUSIC_SOURCE_FRAMES }), player: null, encoder: null, resource: null, retryTimer: null, broken: false },

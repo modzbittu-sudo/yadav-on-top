@@ -1,4 +1,5 @@
 const { BASE_STYLES } = require('./styles');
+const { AUDIO_DEFAULTS } = require('../audio-config');
 
 // Dashboard: token file status, voice control, loudness control, bot list.
 function renderHomePage() {
@@ -85,8 +86,8 @@ function renderHomePage() {
     </div>
 
     <div class="control">
-      <label>Volume (pre-gain): <span id="volDisplay">18x</span></label>
-      <input type="range" id="volSlider" min="0.5" max="100" step="0.1" value="18" />
+      <label>Volume (pre-gain): <span id="volDisplay">${AUDIO_DEFAULTS.volume}x</span></label>
+      <input type="range" id="volSlider" min="0.5" max="100" step="0.1" value="${AUDIO_DEFAULTS.volume}" />
       <div class="hint">The loudness knob. Applied in float before the chain, so it never clips on its own - the limiter holds the peak at 0.95.</div>
     </div>
 
