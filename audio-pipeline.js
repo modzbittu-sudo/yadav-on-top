@@ -191,6 +191,7 @@ function buildLoudnessFilter(options = {}) {
     const threshold = 0.5 - (drive / 100) * 0.45;
     const makeup = 1 + (drive / 100) * 6;
     parts.push(`acompressor=threshold=${threshold.toFixed(4)}:ratio=${ratio.toFixed(2)}:attack=5:release=120:makeup=${makeup.toFixed(2)}:knee=6`);
+    parts.push('asoftclip=type=tanh:threshold=0.85:output=1');
   }
 
   if (targetLufs !== null && Number.isFinite(targetLufs)) {

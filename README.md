@@ -60,10 +60,10 @@ keep using the `BOT_TOKENS` env var, which is written into the file once at star
 Old behaviour was a single `volume=N` ffmpeg pass, which just clips past ~1.0.
 Audio now runs through a float PCM mixer and a proper chain:
 
-1. **Volume (pre-gain)** (0.5–100, default 24) — the loudness knob. Applied in
+1. **Volume (pre-gain)** (0.5–100, default 32) — the loudness knob. Applied in
    float, so a high multiplier cannot clip on its own
-2. **Drive** (0–100, default 65) — `acompressor` with makeup gain. Character, not
-   level: it squeezes peaks so more of the track sits near the ceiling
+2. **Drive** (0–100, default 85) — `acompressor` with makeup gain followed by a
+  tanh soft clipper for audible saturation; the limiter still caps output peaks
 3. **Target LUFS** (optional) — `loudnorm` pass, e.g. `-9`, for a guaranteed level
 4. **Limiter** (on by default) — `alimiter` holding the peak at 0.95, so no
    combination of the above can ever clip
@@ -130,7 +130,7 @@ Use these values in Render:
   - `HOST=0.0.0.0`
   - `PORT=10000`
   - `TOKENS_FILE=tokens.txt`
-  - `AUDIO_VOLUME=24`, `AUDIO_DRIVE=65`, `AUDIO_LIMITER=true`
+  - `AUDIO_VOLUME=32`, `AUDIO_DRIVE=85`, `AUDIO_LIMITER=true`
   - `MIC_GAIN=6`, `MIC_ROUTE_DEFAULT=mix`
   - `VOICE_CHANNEL_IDS=your-channel-id-here` (only needed with `AUTO_JOIN=true`)
 

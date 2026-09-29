@@ -7,7 +7,7 @@ const { PcmMixer, buildLoudnessFilter, createEncoder, createDecoder, BLOCK_FRAME
 const { AUDIO_DEFAULTS, MUSIC_BUFFER } = require('../audio-config');
 
 test('audio config keeps shared playback loud and its buffer thresholds ordered', () => {
-  assert.deepEqual(AUDIO_DEFAULTS, { volume: 24, drive: 65, limiter: true, micGain: 6 });
+  assert.deepEqual(AUDIO_DEFAULTS, { volume: 32, drive: 85, limiter: true, micGain: 6, busRetryMs: 2000 });
   assert.ok(MUSIC_BUFFER.resumeBytes < MUSIC_BUFFER.pauseBytes);
   assert.ok(MUSIC_BUFFER.pauseBytes < MUSIC_BUFFER.maxFrames * BYTES_PER_FRAME);
 });
@@ -102,7 +102,9 @@ test('buildLoudnessFilter adds compression and limiting', () => {
 
   const boosted = buildLoudnessFilter({ drive: 40, limiter: true });
   assert.match(boosted, /^acompressor=/);
+  assert.match(boosted, /asoftclip=type=tanh/);
   assert.match(boosted, /alimiter=limit=0\.95/);
+  assert.ok(boosted.indexOf('asoftclip=') < boosted.indexOf('alimiter='), 'soft clipping stays before the peak limiter');
   assert.match(boosted, /level=disabled/, 'the limit has to be respected, not auto-normalised');
 
   const loudnormed = buildLoudnessFilter({ targetLufs: -9 });

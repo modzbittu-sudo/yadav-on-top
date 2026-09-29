@@ -1,8 +1,9 @@
 const AUDIO_DEFAULTS = Object.freeze({
-  volume: 24,
-  drive: 65,
+  volume: 32,
+  drive: 85,
   limiter: true,
   micGain: 6,
+  busRetryMs: 2000,
 });
 
 const MUSIC_BUFFER = Object.freeze({

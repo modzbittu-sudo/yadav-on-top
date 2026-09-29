@@ -280,7 +280,7 @@ function scheduleBusRetry(name) {
     if (!bus.broken) return;
     console.log(`🔁 Retrying bus "${name}"...`);
     startBus(name);
-  }, 15000);
+  }, AUDIO_DEFAULTS.busRetryMs);
 }
 
 function applyLoudnessFilter() {
