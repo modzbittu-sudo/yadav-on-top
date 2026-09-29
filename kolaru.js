@@ -93,8 +93,6 @@ const loudness = {
   drive: clampNumber(process.env.AUDIO_DRIVE, 0, 100, 40),
   limiter: (process.env.AUDIO_LIMITER || 'true').toLowerCase() !== 'false',
   targetLufs: process.env.AUDIO_TARGET_LUFS ? clampNumber(process.env.AUDIO_TARGET_LUFS, -31, -4, null) : null,
-  duckMusic: (process.env.AUDIO_DUCK_MUSIC || 'true').toLowerCase() !== 'false',
-  duckLevel: clampNumber(process.env.AUDIO_DUCK_LEVEL, 0, 1, 0.35),
   micGain: clampNumber(process.env.MIC_GAIN, 0.1, 20, 6),
 };
 
@@ -300,11 +298,8 @@ function isMicActive() {
 }
 
 function refreshGains() {
-  const ducked = isMicActive() && loudness.duckMusic;
-  const musicGain = loudness.volume * (ducked ? loudness.duckLevel : 1);
-
-  buses.mix.mixer.setSourceGain('music', musicGain);
-  buses.music.mixer.setSourceGain('music', musicGain);
+  buses.mix.mixer.setSourceGain('music', loudness.volume);
+  buses.music.mixer.setSourceGain('music', loudness.volume);
   buses.mix.mixer.setSourceGain('mic', loudness.micGain);
   buses.mic.mixer.setSourceGain('mic', loudness.micGain);
 }
@@ -1086,7 +1081,7 @@ const server = http.createServer(async (req, res) => {
   if ((url.pathname === '/audio/loudness' || url.pathname === '/audio/volume') && req.method === 'POST') {
     try {
       const body = await parseJSONBody(req);
-      // Volume, mic gain and ducking are mixer-side and instant. Only a change
+      // Volume and mic gain are mixer-side and instant. Only a change
       // to the ffmpeg chain (drive / limiter / LUFS) needs the encoders rebuilt,
       // otherwise dragging a slider restarts every bus.
       const filterBefore = currentFilter();
@@ -1094,8 +1089,6 @@ const server = http.createServer(async (req, res) => {
       if (body.volume !== undefined) loudness.volume = clampNumber(body.volume, 0.5, 100, loudness.volume);
       if (body.micGain !== undefined) loudness.micGain = clampNumber(body.micGain, 0.1, 20, loudness.micGain);
       if (body.drive !== undefined) loudness.drive = clampNumber(body.drive, 0, 100, loudness.drive);
-      if (body.duckLevel !== undefined) loudness.duckLevel = clampNumber(body.duckLevel, 0, 1, loudness.duckLevel);
-      if (body.duckMusic !== undefined) loudness.duckMusic = Boolean(body.duckMusic);
       if (body.limiter !== undefined) loudness.limiter = Boolean(body.limiter);
       if (body.targetLufs !== undefined) {
         loudness.targetLufs = body.targetLufs === null || body.targetLufs === ''

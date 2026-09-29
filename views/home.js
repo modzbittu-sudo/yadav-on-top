@@ -90,33 +90,6 @@ function renderHomePage() {
       <div class="hint">The loudness knob. Applied in float before the chain, so it never clips on its own - the limiter holds the peak at 0.95.</div>
     </div>
 
-    <div class="control">
-      <label>Drive / Compression: <span id="driveDisplay">40</span></label>
-      <input type="range" id="driveSlider" min="0" max="100" step="1" value="40" />
-      <div class="hint">Character, not level: squeezes the peaks so the whole track sits closer to the limit. Higher = punchier and more even, on music you'll hear it as "in your face".</div>
-    </div>
-
-    <div class="control">
-      <label>Target Loudness (LUFS, blank = off): <span id="lufsDisplay">off</span></label>
-      <input id="lufsInput" placeholder="e.g. -9" />
-      <div class="hint">Measures the audio and pulls it to this loudness. Use this when you want a guaranteed level rather than a raw multiplier.</div>
-    </div>
-
-    <div class="control check">
-      <input type="checkbox" id="limiterCheck" checked />
-      <label for="limiterCheck">Limiter on (prevents clipping after boost)</label>
-    </div>
-
-    <div class="control check">
-      <input type="checkbox" id="duckCheck" checked />
-      <label for="duckCheck">Duck music while the mic is live</label>
-    </div>
-
-    <div class="control">
-      <label>Duck level: <span id="duckDisplay">0.35</span></label>
-      <input type="range" id="duckSlider" min="0" max="1" step="0.05" value="0.35" />
-    </div>
-
     <div class="actions">
       <button id="uploadPlayBtn" style="background:#8b5cf6;color:#fff;">Upload &amp; Play to All</button>
       <button id="playSavedBtn" style="background:#0ea5e9;color:#fff;">Play Saved Audio</button>
@@ -253,14 +226,6 @@ function renderHomePage() {
     var channelInput = el('inputChannel');
     var volSlider = el('volSlider');
     var volDisplay = el('volDisplay');
-    var driveSlider = el('driveSlider');
-    var driveDisplay = el('driveDisplay');
-    var lufsInput = el('lufsInput');
-    var lufsDisplay = el('lufsDisplay');
-    var limiterCheck = el('limiterCheck');
-    var duckCheck = el('duckCheck');
-    var duckSlider = el('duckSlider');
-    var duckDisplay = el('duckDisplay');
 
     var renderTokenList = function (data) {
       var list = (data && data.tokens) || [];
@@ -318,14 +283,6 @@ function renderHomePage() {
       var loudness = (info && info.loudness) || {};
       volSlider.value = loudness.volume;
       volDisplay.textContent = Number(loudness.volume).toFixed(1) + 'x';
-      driveSlider.value = loudness.drive;
-      driveDisplay.textContent = String(loudness.drive);
-      lufsInput.value = loudness.targetLufs === null || loudness.targetLufs === undefined ? '' : loudness.targetLufs;
-      lufsDisplay.textContent = loudness.targetLufs ? loudness.targetLufs + ' LUFS' : 'off';
-      limiterCheck.checked = loudness.limiter !== false;
-      duckCheck.checked = loudness.duckMusic !== false;
-      duckSlider.value = loudness.duckLevel;
-      duckDisplay.textContent = Number(loudness.duckLevel).toFixed(2);
       renderTokenFile(info);
     };
 
@@ -468,24 +425,6 @@ function renderHomePage() {
     volSlider.addEventListener('input', function (event) {
       volDisplay.textContent = Number(event.target.value).toFixed(1) + 'x';
       pushLoudness({ volume: Number(event.target.value) });
-    });
-
-    driveSlider.addEventListener('input', function (event) {
-      driveDisplay.textContent = event.target.value;
-      pushLoudness({ drive: Number(event.target.value) });
-    });
-
-    lufsInput.addEventListener('change', function (event) {
-      var value = event.target.value.trim();
-      lufsDisplay.textContent = value ? value + ' LUFS' : 'off';
-      saveLoudness({ targetLufs: value === '' ? null : Number(value) });
-    });
-
-    limiterCheck.addEventListener('change', function (event) { saveLoudness({ limiter: event.target.checked }); });
-    duckCheck.addEventListener('change', function (event) { saveLoudness({ duckMusic: event.target.checked }); });
-    duckSlider.addEventListener('input', function (event) {
-      duckDisplay.textContent = Number(event.target.value).toFixed(2);
-      pushLoudness({ duckLevel: Number(event.target.value) });
     });
 
     el('uploadPlayBtn').addEventListener('click', function () {

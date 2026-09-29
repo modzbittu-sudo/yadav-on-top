@@ -25,6 +25,7 @@ test('dashboard page ships valid inline JavaScript', () => {
   assert.match(html, /id="addBulkBtn"/);
   assert.match(html, /id="importTxtBtn"/, 'import tokens from a text file');
   assert.match(html, /Edit tokens\.txt/);
+  assert.doesNotMatch(html, /driveSlider|lufsInput|limiterCheck|duckCheck|duckLevel/);
 });
 
 test('mic routing page ships valid inline JavaScript', () => {
@@ -35,6 +36,7 @@ test('mic routing page ships valid inline JavaScript', () => {
   assert.doesNotThrow(() => new vm.Script(scripts[0]), 'mic route script must parse');
   assert.match(html, /veera-pcm-tap/, 'references the server-side worklet');
   assert.match(html, /\/mic\/stream/, 'streams over the websocket');
+  assert.doesNotMatch(html, /duckCheck|duckLevel/);
 });
 
 test('token file page ships valid inline JavaScript and the add controls', () => {

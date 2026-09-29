@@ -81,8 +81,8 @@ identical. Measured with real ffmpeg on the same input:
 | volume 12 + drive 40 + limiter | −5.7 dBFS | 31130 |
 | volume 12 + drive 40 + −9 LUFS | −11.4 dBFS | 23997 |
 
-Music is also ducked automatically while the mic is live. All of it is editable
-on the dashboard or via `POST /audio/loudness`.
+Music gain stays constant while the mic is live. Volume remains adjustable on
+the dashboard or via `POST /audio/loudness`.
 
 ## Mic routing
 
@@ -153,7 +153,7 @@ Use these values in Render:
 | GET | `/channels` | voice channels visible to an account (`?index=N`) |
 | POST | `/join`, `/stay`, `/leave` | voice channel control |
 | POST | `/audio/upload`, `/audio/play`, `/audio/stop` | music player |
-| POST | `/audio/loudness` | volume / drive / LUFS / limiter / ducking |
+| POST | `/audio/loudness` | volume / drive / LUFS / limiter |
 | POST | `/audio/mute`, `/audio/unmute`, `/audio/deafen`, `/audio/undeafen` | voice flags |
 | WS | `/mic/stream` | mic PCM stream |
 | GET | `/mic/status` | mic client + packet counters |

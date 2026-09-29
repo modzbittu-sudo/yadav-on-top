@@ -322,8 +322,8 @@ test('mic audio streams over the websocket into the mix buses', async () => {
   assert.ok(app.buses.mic.mixer.sources.get('mic').received > 0, 'mic reached the mic-only bus');
   assert.equal(app.buses.music.mixer.sources.has('mic'), false, 'music-only bus stays clean');
 
-  // Music is ducked while the mic is live.
-  assert.ok(app.buses.mix.mixer.sources.get('music').gain < 30, 'music is ducked');
+  // Mic activity does not lower music volume.
+  assert.equal(app.buses.mix.mixer.sources.get('music').gain, 30);
 
   socket.close();
   await new Promise((resolve) => setTimeout(resolve, 100));
@@ -457,7 +457,7 @@ test('voice channels can be listed for an account', async () => {
 
 test('volume changes do not restart the ffmpeg buses', async () => {
   const before = app.buses.mix.encoder;
-  await postJson('/audio/loudness', { volume: 9, micGain: 4, duckLevel: 0.5 });
+  await postJson('/audio/loudness', { volume: 9, micGain: 4 });
   assert.equal(app.buses.mix.encoder, before, 'mixer-side settings are instant, no respawn');
 
   const beforeDrive = app.buses.mix.encoder;

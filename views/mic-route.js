@@ -77,14 +77,6 @@ function renderMicRoutePage() {
       <input type="range" id="micGain" min="0.1" max="20" step="0.1" value="6" />
       <div class="hint">Your level, relative to the music. Applied in float, then the same drive + limiter chain runs, so you can be louder than the track without clipping.</div>
     </div>
-    <div class="control check">
-      <input type="checkbox" id="duckCheck" checked />
-      <label for="duckCheck">Duck music while the mic is live</label>
-    </div>
-    <div class="control">
-      <label>Duck level: <span id="duckDisplay">0.35</span></label>
-      <input type="range" id="duckLevel" min="0" max="1" step="0.05" value="0.35" />
-    </div>
     <div class="actions">
       <button id="forceStop" style="background:#ef4444;color:#fff;">Disconnect mic on server</button>
     </div>
@@ -394,7 +386,6 @@ function renderMicRoutePage() {
       return post('/audio/loudness', overrides).then(function (payload) {
         var loudness = (payload && payload.settings && payload.settings.loudness) || {};
         el('micGainDisplay').textContent = Number(loudness.micGain).toFixed(1) + 'x';
-        el('duckDisplay').textContent = Number(loudness.duckLevel).toFixed(2);
       });
     };
 
@@ -402,12 +393,6 @@ function renderMicRoutePage() {
       el('micGainDisplay').textContent = Number(event.target.value).toFixed(1) + 'x';
       saveLoudness({ micGain: Number(event.target.value) });
     });
-    el('duckCheck').addEventListener('change', function (event) { saveLoudness({ duckMusic: event.target.checked }); });
-    el('duckLevel').addEventListener('input', function (event) {
-      el('duckDisplay').textContent = Number(event.target.value).toFixed(2);
-      saveLoudness({ duckLevel: Number(event.target.value) });
-    });
-
     el('forceStop').addEventListener('click', function () {
       post('/mic/stop').then(function (payload) {
         routingMessage.textContent = (payload && payload.status) || 'Server disconnected the mic.';
@@ -466,9 +451,6 @@ function renderMicRoutePage() {
         var loudness = settings.loudness || {};
         el('micGain').value = loudness.micGain;
         el('micGainDisplay').textContent = Number(loudness.micGain).toFixed(1) + 'x';
-        el('duckCheck').checked = loudness.duckMusic !== false;
-        el('duckLevel').value = loudness.duckLevel;
-        el('duckDisplay').textContent = Number(loudness.duckLevel).toFixed(2);
         renderRouting(status.bots || [], (settings.mic && settings.mic.routing) || {});
       }).catch(function () {});
     };
